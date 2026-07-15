@@ -3,6 +3,8 @@ package com.teads.summerschool.notification;
 import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.metrics.BidderMetrics;
 import com.teads.summerschool.proto.AuctionNoticeProto;
+import com.teads.summerschool.record.BidRecord;
+import com.teads.summerschool.record.BidRecordRepository;
 import com.teads.summerschool.record.BidderStatsCache;
 import com.teads.summerschool.record.OwnBidCache;
 import org.slf4j.Logger;
@@ -20,17 +22,20 @@ public class AuctionNoticeConsumer {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
+    private final BidRecordRepository bidRecordRepository;
 
     public AuctionNoticeConsumer(WinNoticeRepository winNoticeRepository,
                                  BidderProperties properties,
                                  BidderStatsCache statsCache,
                                  BidderMetrics metrics,
-                                 OwnBidCache ownBidCache) {
+                                 OwnBidCache ownBidCache,
+                                 BidRecordRepository bidRecordRepository) {
         this.winNoticeRepository = winNoticeRepository;
         this.properties = properties;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
+        this.bidRecordRepository = bidRecordRepository;
     }
 
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
@@ -53,24 +58,67 @@ public class AuctionNoticeConsumer {
             log.debug("KAFKA  id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
 
             if (won) {
-                // TODO: handle win — record the win, decrement creative budget, update metrics
-                // Hints:
-                //   - ourBid.creativeId() / ourBid.bidPrice() is what we bid on this auction
-                //   - Call statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice())
-                //     (returns a Mono<Double>) and winNoticeRepository.save(...) (returns a
-                //     Mono<WinNotice>) — safe to .block() here, this listener runs on its own
-                //     dedicated Kafka consumer thread, not the Netty event loop
-                //   - Call metrics.recordWin(notice.getClearingPrice())
-                //   - Save a WinNotice via winNoticeRepository.save(...)
-                log.info("** WIN  id={} creative={} clearing={} — not yet handled",
-                        notice.getRequestId(), ourBid.creativeId(), notice.getClearingPrice());
+                String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
+
+                // Record win in per-segment stats
+                if (!segmentKey.isEmpty()) {
+                    statsCache.recordWinForSegment(
+                        segmentKey,
+                        notice.getClearingPrice(),
+                        ourBid.bidPrice()
+                    ).block();
+                }
+
+                // Existing budget tracking
+                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice()).block();
+
+                // Save win notice to DB
+                WinNotice winNotice = new WinNotice(
+                    notice.getRequestId(),
+                    properties.getId(),
+                    notice.getClearingPrice(),
+                    ourBid.bidPrice()
+                );
+                winNoticeRepository.save(winNotice).block();
+
+                // Record metrics
+                metrics.recordWin(notice.getClearingPrice());
+
+                log.info("** WIN  id={} creative={} clearing={} segment={}",
+                        notice.getRequestId(), ourBid.creativeId(), notice.getClearingPrice(), segmentKey);
             } else {
-                // TODO: handle loss — update metrics
-                // Hints:
-                //   - ourBid.bidPrice() is what we bid; call metrics.recordLoss()
+                String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
+
+                // Record loss in per-segment stats
+                if (!segmentKey.isEmpty()) {
+                    statsCache.recordLossForSegment(segmentKey, ourBid.bidPrice()).block();
+                }
+
+                // Record metrics
+                metrics.recordLoss();
+
+                log.debug("LOSS id={} bid={} segment={}",
+                        notice.getRequestId(), ourBid.bidPrice(), segmentKey);
             }
         } catch (Exception e) {
             log.error("** KAFKA ERROR  failed to process auction notice: {}", e.getMessage());
         }
+    }
+
+    /**
+     * Query BidRecord and build segment key from targeting dimensions.
+     * Returns empty string if BidRecord not found or targeting is incomplete.
+     */
+    private String buildSegmentKeyForRequest(String requestId) {
+        BidRecord record = bidRecordRepository.findByRequestId(requestId).block();
+        if (record == null) {
+            log.warn("BidRecord not found for requestId={}", requestId);
+            return "";
+        }
+        return BidderStatsCache.buildSegmentKey(
+            record.getGeo(),
+            record.getDeviceType(),
+            record.getAudienceSegment()
+        );
     }
 }

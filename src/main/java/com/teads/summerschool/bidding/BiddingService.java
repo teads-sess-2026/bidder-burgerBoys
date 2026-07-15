@@ -113,11 +113,83 @@ public class BiddingService {
         return bidRecordRepository.save(record).thenReturn(Optional.empty());
     }
 
-    private double computeBidPrice(BidRequest request) {
-        // TODO: implement your pricing strategy
-        // The bid must be above request.floorPrice().
-        // Use properties.getStrategy() for tuning parameters.
-        return request.floorPrice() * 1.01;
+    /**
+     * Compute dynamic bid price based on segment win/loss history.
+     * Strategy:
+     * - Cold start (< windowSize auctions): bid floorPrice * coldStartMultiplier
+     * - High win rate (>70%): shade down (winning too easily, save budget)
+     * - Low win rate (<30%): bid up (losing too much, need to be more competitive)
+     * - Healthy win rate (30-70%): bid base * marketMultiplier
+     * - 5% exploration: random ±10% offset to prevent convergence
+     */
+    private double computeBidPrice(BidRequest request, Creative creative) {
+        double floorPrice = request.floorPrice();
+        BidderProperties.Strategy strategy = properties.getStrategy();
+
+        // Build segment key from targeting
+        String segmentKey = BidderStatsCache.buildSegmentKey(
+            request.targeting().geo(),
+            request.targeting().deviceType(),
+            request.targeting().audienceSegment()
+        );
+
+        // Load segment stats from Redis (hot path - must be fast)
+        BidderStatsCache.SegmentStats stats = statsCache.getSegmentStats(segmentKey)
+            .block(Duration.ofMillis(properties.getTimeoutMs()));
+
+        // COLD START: insufficient data, use conservative multiplier
+        if (stats == null || stats.totalAuctions() < strategy.getWindowSize()) {
+            double bid = floorPrice * strategy.getColdStartMultiplier();
+            log.debug("COLD-START segment={} auctions={} bid={}",
+                    segmentKey, stats != null ? stats.totalAuctions() : 0, bid);
+            return enforceConstraints(bid, floorPrice, creative);
+        }
+
+        // WARM STATE: compute base from historical clearing prices
+        double base = stats.avgClearingPrice();
+        double winRate = stats.winRate();
+        double marketMultiplier = strategy.getMarketMultiplier();
+
+        double bid;
+        if (winRate > 0.7) {
+            // Winning too easily - shade down to save budget
+            bid = base * (marketMultiplier - 0.1);
+            log.debug("HIGH-WIN segment={} winRate={} base={} bid={}",
+                    segmentKey, winRate, base, bid);
+        } else if (winRate < 0.3) {
+            // Losing too much - bid more aggressively
+            bid = base * (marketMultiplier + 0.1);
+            log.debug("LOW-WIN segment={} winRate={} base={} bid={}",
+                    segmentKey, winRate, base, bid);
+        } else {
+            // Healthy win rate - maintain steady strategy
+            bid = base * marketMultiplier;
+            log.debug("HEALTHY segment={} winRate={} base={} bid={}",
+                    segmentKey, winRate, base, bid);
+        }
+
+        // EXPLORATION: 5% of time, apply random ±10% offset
+        if (Math.random() < 0.05) {
+            double originalBid = bid;
+            double explorationOffset = (Math.random() * 0.2) - 0.1;  // -0.1 to +0.1
+            bid = bid * (1 + explorationOffset);
+            log.debug("EXPLORE segment={} original={} offset={}% new={}",
+                    segmentKey, originalBid, (int)(explorationOffset * 100), bid);
+        }
+
+        return enforceConstraints(bid, floorPrice, creative);
+    }
+
+    private double enforceConstraints(double bid, double floorPrice, Creative creative) {
+        // Must exceed floor
+        bid = Math.max(bid, floorPrice + 0.01);
+
+        // Respect creative's max bid cap if set
+        if (creative.getMaxBidPrice() != null) {
+            bid = Math.min(bid, creative.getMaxBidPrice());
+        }
+
+        return bid;
     }
 
     /** Total remaining budget across all this bidder's creatives. */

@@ -26,6 +26,37 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 public class BidderStatsCache {
 
+    /**
+     * Win/loss statistics for a targeting segment.
+     */
+    public record SegmentStats(
+        int totalAuctions,
+        int totalWins,
+        double avgClearingPrice,
+        double winRate,
+        double avgLossPrice
+    ) {
+        public static SegmentStats empty() {
+            return new SegmentStats(0, 0, 0.0, 0.0, 0.0);
+        }
+
+        public static SegmentStats fromHashData(
+            int totalAuctions,
+            int totalWins,
+            double sumClearingPrices,
+            double sumLossPrices
+        ) {
+            if (totalAuctions == 0) return empty();
+
+            double winRate = (double) totalWins / totalAuctions;
+            double avgClearingPrice = totalWins > 0 ? sumClearingPrices / totalWins : 0.0;
+            int losses = totalAuctions - totalWins;
+            double avgLossPrice = losses > 0 ? sumLossPrices / losses : 0.0;
+
+            return new SegmentStats(totalAuctions, totalWins, avgClearingPrice, winRate, avgLossPrice);
+        }
+    }
+
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
     // KEYS[1] = budget key, ARGV[1] = default budget (used only if the key doesn't exist yet),
@@ -38,6 +69,17 @@ public class BidderStatsCache {
             end
             return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
             """, Double.class);
+
+    private static final RedisScript<Void> RECORD_SEGMENT_WIN_SCRIPT = RedisScript.of("""
+            redis.call('HINCRBY', KEYS[1], 'totalAuctions', 1)
+            redis.call('HINCRBY', KEYS[1], 'totalWins', 1)
+            redis.call('HINCRBYFLOAT', KEYS[1], 'sumClearingPrices', tonumber(ARGV[1]))
+            """, Void.class);
+
+    private static final RedisScript<Void> RECORD_SEGMENT_LOSS_SCRIPT = RedisScript.of("""
+            redis.call('HINCRBY', KEYS[1], 'totalAuctions', 1)
+            redis.call('HINCRBYFLOAT', KEYS[1], 'sumLossPrices', tonumber(ARGV[1]))
+            """, Void.class);
 
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
@@ -56,6 +98,37 @@ public class BidderStatsCache {
     /** Redis key holding the remaining budget for one creative. */
     public String budgetKey(String creativeId) {
         return properties.getId() + "_" + creativeId + "_budget";
+    }
+
+    /** Redis key holding stats for a targeting segment. */
+    public String segmentStatsKey(String segmentKey) {
+        return properties.getId() + "_stats_" + segmentKey;
+    }
+
+    /** Build segment key from targeting dimensions. */
+    public static String buildSegmentKey(String geo, String deviceType, String audienceSegment) {
+        String g = geo == null ? "" : geo;
+        String d = deviceType == null ? "" : deviceType;
+        String a = audienceSegment == null ? "" : audienceSegment;
+        return g + "_" + d + "_" + a;
+    }
+
+    private int parseInt(String value) {
+        if (value == null || value.isEmpty()) return 0;
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    private double parseDouble(String value) {
+        if (value == null || value.isEmpty()) return 0.0;
+        try {
+            return Double.parseDouble(value);
+        } catch (NumberFormatException e) {
+            return 0.0;
+        }
     }
 
     /** Set a creative's remaining budget to its full limit. Called once per creative on startup. */
@@ -119,5 +192,59 @@ public class BidderStatsCache {
 
     public long getSampleCount() {
         return winCount.get();
+    }
+
+    /**
+     * Record a win for a targeting segment, updating aggregate stats.
+     * Called from Kafka consumer (async, not hot path).
+     */
+    public Mono<Void> recordWinForSegment(String segmentKey, double clearingPrice, double ourBidPrice) {
+        String key = segmentStatsKey(segmentKey);
+        return redis.execute(
+                RECORD_SEGMENT_WIN_SCRIPT,
+                List.of(key),
+                List.of(String.valueOf(clearingPrice), String.valueOf(ourBidPrice))
+        )
+        .then()
+        .doOnSuccess(v -> log.debug("SEG-WIN  key={} clearing={}", key, clearingPrice));
+    }
+
+    /**
+     * Record a loss for a targeting segment, updating aggregate stats.
+     * Called from Kafka consumer (async, not hot path).
+     */
+    public Mono<Void> recordLossForSegment(String segmentKey, double ourBidPrice) {
+        String key = segmentStatsKey(segmentKey);
+        return redis.execute(
+                RECORD_SEGMENT_LOSS_SCRIPT,
+                List.of(key),
+                List.of(String.valueOf(ourBidPrice))
+        )
+        .then()
+        .doOnSuccess(v -> log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice));
+    }
+
+    /**
+     * Retrieve aggregate win/loss stats for a targeting segment.
+     * HOT PATH: called on every bid request. Must complete in <5ms.
+     */
+    public Mono<SegmentStats> getSegmentStats(String segmentKey) {
+        String key = segmentStatsKey(segmentKey);
+
+        return redis.opsForHash().entries(key)
+            .collectMap(e -> e.getKey().toString(), e -> e.getValue().toString())
+            .map(data -> {
+                if (data.isEmpty()) {
+                    return SegmentStats.empty();
+                }
+
+                int totalAuctions = parseInt(data.get("totalAuctions"));
+                int totalWins = parseInt(data.get("totalWins"));
+                double sumClearingPrices = parseDouble(data.get("sumClearingPrices"));
+                double sumLossPrices = parseDouble(data.get("sumLossPrices"));
+
+                return SegmentStats.fromHashData(totalAuctions, totalWins, sumClearingPrices, sumLossPrices);
+            })
+            .defaultIfEmpty(SegmentStats.empty());
     }
 }
