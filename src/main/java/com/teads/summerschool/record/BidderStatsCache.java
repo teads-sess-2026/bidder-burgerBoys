@@ -81,12 +81,31 @@ public class BidderStatsCache {
             redis.call('HINCRBYFLOAT', KEYS[1], 'sumLossPrices', tonumber(ARGV[1]))
             """, Void.class);
 
+
     private final BidderProperties properties;
     private final ReactiveRedisTemplate<String, String> redis;
     private final CreativeRepository creativeRepository;
 
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
+
+    // In-memory budget cache with 2-second TTL for hot path
+    private final java.util.concurrent.ConcurrentHashMap<String, CachedBudget> budgetCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static class CachedBudget {
+        final double budget;
+        final long timestamp;
+
+        CachedBudget(double budget) {
+            this.budget = budget;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > 2000; // 2 seconds TTL
+        }
+    }
 
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
                              CreativeRepository creativeRepository) {
@@ -153,6 +172,9 @@ public class BidderStatsCache {
                         })
                         .thenReturn(after))
                 .doOnNext(after -> {
+                    // Update in-memory budget cache
+                    budgetCache.put(creativeId, new CachedBudget(after));
+
                     winCount.incrementAndGet();
                     synchronized (recentWinPrices) {
                         recentWinPrices.addLast(clearingPrice);
@@ -177,6 +199,70 @@ public class BidderStatsCache {
                 })
                 .switchIfEmpty(redis.opsForValue().setIfAbsent(key, String.valueOf(defaultBudget))
                         .thenReturn(defaultBudget));
+    }
+
+    /**
+     * Batch check remaining budgets for multiple creatives using in-memory cache first, then MGET.
+     * Returns a map of creativeId -> remainingBudget.
+     * HOT PATH: must complete in <10ms for typical creative counts (2-4).
+     */
+    public Mono<java.util.Map<String, Double>> getRemainingBudgets(List<String> creativeIds) {
+        if (creativeIds.isEmpty()) {
+            return Mono.just(java.util.Map.of());
+        }
+
+        java.util.Map<String, Double> result = new java.util.HashMap<>();
+        List<String> needsFetch = new java.util.ArrayList<>();
+
+        // Fast path: check in-memory cache
+        for (String creativeId : creativeIds) {
+            CachedBudget cached = budgetCache.get(creativeId);
+            if (cached != null && !cached.isExpired()) {
+                result.put(creativeId, cached.budget);
+            } else {
+                needsFetch.add(creativeId);
+            }
+        }
+
+        // If all found in cache, return immediately
+        if (needsFetch.isEmpty()) {
+            return Mono.just(result);
+        }
+
+        // Slow path: fetch missing budgets from Redis
+        double defaultBudget = properties.getCreativeBudget();
+        List<String> keys = needsFetch.stream().map(this::budgetKey).toList();
+
+        return redis.opsForValue().multiGet(keys)
+            .map(values -> {
+                for (int i = 0; i < needsFetch.size(); i++) {
+                    String creativeId = needsFetch.get(i);
+                    String value = values != null && i < values.size() ? values.get(i) : null;
+
+                    double budget;
+                    if (value != null) {
+                        try {
+                            budget = Double.parseDouble(value);
+                        } catch (NumberFormatException e) {
+                            budget = defaultBudget;
+                        }
+                    } else {
+                        budget = defaultBudget;
+                    }
+
+                    result.put(creativeId, budget);
+                    budgetCache.put(creativeId, new CachedBudget(budget));
+                }
+                return result;
+            })
+            .defaultIfEmpty(result)
+            .map(map -> {
+                // Fill in defaults for any still missing
+                for (String id : needsFetch) {
+                    map.putIfAbsent(id, defaultBudget);
+                }
+                return map;
+            });
     }
 
     public long getWinCount() {
@@ -224,27 +310,58 @@ public class BidderStatsCache {
         .doOnSuccess(v -> log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice));
     }
 
+    // In-memory cache for segment stats with 10-second TTL
+    private final java.util.concurrent.ConcurrentHashMap<String, CachedSegmentStats> segmentStatsCache =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static class CachedSegmentStats {
+        final SegmentStats stats;
+        final long timestamp;
+
+        CachedSegmentStats(SegmentStats stats) {
+            this.stats = stats;
+            this.timestamp = System.currentTimeMillis();
+        }
+
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > 10000; // 10 seconds TTL
+        }
+    }
+
     /**
      * Retrieve aggregate win/loss stats for a targeting segment.
      * HOT PATH: called on every bid request. Must complete in <5ms.
+     * Uses in-memory cache with 10s TTL to minimize Redis calls.
      */
     public Mono<SegmentStats> getSegmentStats(String segmentKey) {
+        // Fast path: return from cache if fresh
+        CachedSegmentStats cached = segmentStatsCache.get(segmentKey);
+        if (cached != null && !cached.isExpired()) {
+            return Mono.just(cached.stats);
+        }
+
+        // Slow path: load from Redis
         String key = segmentStatsKey(segmentKey);
 
         return redis.opsForHash().entries(key)
             .collectMap(e -> e.getKey().toString(), e -> e.getValue().toString())
             .map(data -> {
+                SegmentStats stats;
                 if (data.isEmpty()) {
-                    return SegmentStats.empty();
+                    stats = SegmentStats.empty();
+                } else {
+                    int totalAuctions = parseInt(data.get("totalAuctions"));
+                    int totalWins = parseInt(data.get("totalWins"));
+                    double sumClearingPrices = parseDouble(data.get("sumClearingPrices"));
+                    double sumLossPrices = parseDouble(data.get("sumLossPrices"));
+                    stats = SegmentStats.fromHashData(totalAuctions, totalWins, sumClearingPrices, sumLossPrices);
                 }
 
-                int totalAuctions = parseInt(data.get("totalAuctions"));
-                int totalWins = parseInt(data.get("totalWins"));
-                double sumClearingPrices = parseDouble(data.get("sumClearingPrices"));
-                double sumLossPrices = parseDouble(data.get("sumLossPrices"));
-
-                return SegmentStats.fromHashData(totalAuctions, totalWins, sumClearingPrices, sumLossPrices);
+                // Cache the result
+                segmentStatsCache.put(segmentKey, new CachedSegmentStats(stats));
+                return stats;
             })
-            .defaultIfEmpty(SegmentStats.empty());
+            .defaultIfEmpty(SegmentStats.empty())
+            .doOnNext(stats -> segmentStatsCache.put(segmentKey, new CachedSegmentStats(stats)));
     }
 }

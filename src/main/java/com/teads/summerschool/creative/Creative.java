@@ -1,5 +1,6 @@
 package com.teads.summerschool.creative;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import org.springframework.data.annotation.Id;
 import org.springframework.data.annotation.PersistenceCreator;
 import org.springframework.data.annotation.Transient;
@@ -36,6 +37,7 @@ public class Creative implements Persistable<String> {
     // by application code (e.g. CreativeSeeder) and false for rows materialized from the DB via
     // the @PersistenceCreator constructor below — see Persistable<String>.
     @Transient
+    @JsonIgnore
     private boolean isNew = true;
 
     public Creative() {}
@@ -59,6 +61,7 @@ public class Creative implements Persistable<String> {
     }
 
     @Override
+    @JsonIgnore
     public boolean isNew() { return isNew; }
 
     @Override
