@@ -1,0 +1,138 @@
+# Standalone infra (Postgres/Kafka/Redis/Prometheus/Grafana) for running and testing
+# your bidder WITHOUT the ssp repo — useful for local development before you're wired
+# up to the shared SSP. Creates the "ss2026-net" network that docker-compose.yml (the
+# bidder app itself) joins as external.
+#
+#   make run-infra   → docker compose -f docker-compose.infra.yml up -d
+#
+#   Kafka UI      http://localhost:8090
+#   Redis UI      http://localhost:8091
+#   Prometheus    http://localhost:9090
+#   Grafana       http://localhost:3000   (admin / admin)
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: ss2026-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: summerschool
+      POSTGRES_USER: bidder
+      POSTGRES_PASSWORD: bidder
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bidder -d summerschool"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Kafka (KRaft — no Zookeeper needed) ──────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: ss2026-kafka
+    restart: unless-stopped
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092,PLAINTEXT_TS://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092,PLAINTEXT_TS://${TAILSCALE_IP:-127.0.0.1}:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT_TS:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 2
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: ss2026-kafka-ui
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: ss2026
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ── Redis (shared per-creative budget cache) ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: ss2026-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Redis UI (browse/edit the budget cache keys) ─────────────────────────────
+  redis-ui:
+    image: rediscommander/redis-commander:latest
+    container_name: ss2026-redis-ui
+    restart: unless-stopped
+    ports:
+      - "8091:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Prometheus (scrapes this bidder's /actuator/prometheus) ─────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ss2026-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # reach a bidder running on the host instead of in Docker
+
+  # ── Grafana (pre-provisioned with the bidder-overview dashboard) ────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ss2026-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+networks:
+  default:
+    name: ss2026-net
+
+volumes:
+  postgres_data:
+  grafana_data:

@@ -1,0 +1,75 @@
+{
+  "title": "Bidder Overview",
+  "uid": "bidder-overview",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "5s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Bids / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) (rate({__name__=~\".+_bids_total\"}[1m]))", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Wins vs Losses / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) (rate({__name__=~\".+_wins_total\"}[1m]))", "legendFormat": "wins {{bidder}}" },
+        { "refId": "B", "expr": "sum by (bidder) (rate({__name__=~\".+_losses_total\"}[1m]))", "legendFormat": "losses {{bidder}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Win rate",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder)({__name__=~\".+_wins_total\"}) / clamp_min(sum by (bidder)({__name__=~\".+_wins_total\"}) + sum by (bidder)({__name__=~\".+_losses_total\"}), 1)", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Remaining budget",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder) ({__name__=~\".+_budget_remaining\"})", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Avg bid latency (ms)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "1000 * sum by (bidder)(rate({__name__=~\".+_bid_latency_seconds_sum\"}[1m])) / clamp_min(sum by (bidder)(rate({__name__=~\".+_bid_latency_seconds_count\"}[1m])), 0.0001)", "legendFormat": "{{bidder}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "No-bid reasons / sec",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (bidder, reason) (rate({__name__=~\".+_nobids_total\"}[1m]))", "legendFormat": "{{bidder}} / {{reason}}" }
+      ]
+    }
+  ]
+}

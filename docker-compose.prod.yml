@@ -1,0 +1,18 @@
+# Prod mode: run only the bidder app, pointed at the always-on AWS backing
+# services (see ../infra/terraform) instead of the local ssp docker-compose
+# stack. No "ss2026-net" dependency — this uses its own default network.
+# Fill config.prod.env first (see config.prod.env.example), then: make run-prod
+
+services:
+
+  bidder:
+    build: .
+    container_name: ss2026-bidder
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    env_file:
+      - config.prod.env
+    environment:
+      BIDDER_ID: ${BIDDER_ID:-teads-bidder}
+      SERVER_PORT: 8080

@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+option java_package = "com.teads.summerschool.proto";
+option java_outer_classname = "AuctionNoticeProto";
+option java_multiple_files = false;
+
+message AuctionNotice {
+  string request_id = 1;
+  double clearing_price = 2;
+  string winning_bidder_id = 3;
+}

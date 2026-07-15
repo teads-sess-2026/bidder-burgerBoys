@@ -1,0 +1,187 @@
+name: ci
+
+# Distributed to every team bidder repo by infra/scripts/setup-team-ci.sh.
+#
+# Runs on every push/PR. The `deploy` job builds the bidder Docker image and
+# pushes it to ECR first (only for pushes to main, or manual dispatch); the
+# `e2e` job then builds & runs the bidder against Postgres + Redis and pulls
+# the e2e suite from the private infra repo to run it over HTTP. `e2e` always
+# runs after `deploy`, even if `deploy` was skipped or failed, since it does
+# not depend on the pushed image (it builds and runs the jar itself).
+#
+# The VM (see teads-sess-2026/infra terraform) pulls the image `deploy` pushes.
+#
+# All teams share one ECR repo (no push isolation between teams), so images
+# are disambiguated by a <team>-<tag> prefix derived from this repo's name
+# (bidder-<team> -> <team>). Config below is expected to be set once as
+# ORGANIZATION-level variables/secrets on teads-sess-2026 (repo-level values
+# still override if set):
+#
+# Required config:
+#   Variables:  ECR_REPOSITORY  (shared repo URI, `terraform output bidder_ecr_repo`)
+#               AWS_REGION      (optional; defaults to eu-west-1)
+#   Secrets:    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+#               (shared push credentials — `terraform output bidder_push_credentials`)
+#
+# The e2e suite test content is not in the bidder repo — it lives in
+# teads-sess-2026/infra (private) and is checked out at runtime using the
+# E2E_SUITE_TOKEN secret, so students never see the tests.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      AWS_ACCESS_KEY_ID_SET: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
+    steps:
+      - name: Check configuration
+        run: |
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "::error::Set the ECR_REPOSITORY variable (shared ECR repo URI)."
+            exit 1
+          fi
+          if [ "$AWS_ACCESS_KEY_ID_SET" != "true" ]; then
+            echo "::error::Set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY secrets."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Derive team tag prefix from repo name
+        run: echo "TEAM=${GITHUB_REPO_NAME#bidder-}" >> "$GITHUB_ENV"
+        env:
+          GITHUB_REPO_NAME: ${{ github.event.repository.name }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'eu-west-1' }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ vars.ECR_REPOSITORY }}:${{ env.TEAM }}-latest
+            ${{ vars.ECR_REPOSITORY }}:${{ env.TEAM }}-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  e2e:
+    needs: deploy
+    if: always()
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: summerschool
+          POSTGRES_USER: bidder
+          POSTGRES_PASSWORD: bidder
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-retries 5
+        ports:
+          - 6379:6379
+    env:
+      BIDDER_ID: teads-bidder
+      BIDDER_URL: http://localhost:8080
+      DATABASE_URL: postgresql://bidder:bidder@localhost:5432/summerschool
+      REDIS_URL: redis://localhost:6379
+      E2E_SUITE_TOKEN: ${{ secrets.E2E_SUITE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4 # this bidder
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - name: Build bidder
+        run: ./mvnw -q -B -DskipTests package
+
+      - name: Start bidder
+        env:
+          DB_HOST: localhost
+          DB_PORT: '5432'
+          DB_USER: bidder
+          DB_PASSWORD: bidder
+          REDIS_HOST: localhost
+          REDIS_PORT: '6379'
+        run: |
+          java -jar target/summerschool-0.0.1-SNAPSHOT.jar \
+            --spring.kafka.listener.auto-startup=false \
+            > bidder.log 2>&1 &
+          echo "started bidder pid $!"
+
+      - name: Wait for bidder health
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf "$BIDDER_URL/health" >/dev/null 2>&1; then
+              echo "bidder healthy at $BIDDER_URL"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::bidder did not become healthy at $BIDDER_URL"
+          tail -n 150 bidder.log
+          exit 1
+
+      - name: Check e2e suite access
+        if: env.E2E_SUITE_TOKEN == ''
+        run: |
+          echo "::error::Set the E2E_SUITE_TOKEN secret (a PAT with read access to"
+          echo "::error::teads-sess-2026/infra) so CI can pull the private e2e suite."
+          exit 1
+
+      - name: Check out e2e suite (private)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.E2E_REPO || 'teads-sess-2026/infra' }}
+          ref: ${{ vars.E2E_REF || 'main' }}
+          path: e2e
+          token: ${{ secrets.E2E_SUITE_TOKEN }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+          cache-dependency-path: e2e/bidder/go.sum
+
+      - name: Run e2e suite
+        working-directory: e2e/bidder
+        run: make test
+
+      - name: Bidder logs (on failure)
+        if: failure()
+        run: tail -n 200 bidder.log || true

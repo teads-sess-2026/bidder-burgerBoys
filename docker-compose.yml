@@ -1,0 +1,24 @@
+# Infra (Postgres/Kafka/Redis/Prometheus/Grafana) lives in ssp/docker-compose.all.yml
+# — start it there via `make run` in the ssp repo. This file only runs the bidder
+# app itself, joining that stack's external network so "postgres"/"kafka"/"redis"
+# resolve by service name.
+
+services:
+
+  bidder:
+    build: .
+    container_name: ss2026-bidder
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      BIDDER_ID: ${BIDDER_ID:-teads-bidder}
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SERVER_PORT: 8080
+
+networks:
+  default:
+    name: ss2026-net
+    external: true

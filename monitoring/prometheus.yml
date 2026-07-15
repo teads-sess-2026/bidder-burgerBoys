@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # This bidder joins the "ss2026-net" network by service name (see docker-compose.yml).
+  # Running the bidder on the host instead? Scrape it via host.docker.internal:<port>.
+  - job_name: bidders
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - bidder:8080
+          # - host.docker.internal:8080
