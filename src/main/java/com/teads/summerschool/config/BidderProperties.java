@@ -8,7 +8,6 @@ import org.springframework.stereotype.Component;
 public class BidderProperties {
 
     private String id = "teads-bidder";
-    private double budget = 1000.0;
     // Flat budget assigned to each creative on seed; remaining is tracked per creative in Redis.
     private double creativeBudget = 25.0;
     private long timeoutMs = 1000;
@@ -18,8 +17,6 @@ public class BidderProperties {
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
 
-    public double getBudget() { return budget; }
-    public void setBudget(double budget) { this.budget = budget; }
 
     public double getCreativeBudget() { return creativeBudget; }
     public void setCreativeBudget(double creativeBudget) { this.creativeBudget = creativeBudget; }

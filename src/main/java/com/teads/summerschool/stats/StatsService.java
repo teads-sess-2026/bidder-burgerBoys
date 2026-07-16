@@ -27,7 +27,7 @@ public class StatsService {
                 0, 0, 0, 0.0,
                 0, 0.0, 0.0,
                 0.0, 0.0, 0.0,
-                0.0, properties.getBudget(),
+                0.0, properties.getCreativeBudget() * 200.0,
                 new StatsResponse.LatencyStats(0.0, 0, 0, 0, 0),
                 new StatsResponse.NoBidReasons(0, 0, 0),
                 new StatsResponse.PacingStats(0.0, 0.0, null, 0.0)
