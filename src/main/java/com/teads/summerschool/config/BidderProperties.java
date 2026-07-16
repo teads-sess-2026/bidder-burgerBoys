@@ -35,12 +35,13 @@ public class BidderProperties {
 
     public static class Strategy {
         private int minSamples = 10;
-        private double coldStartMultiplier = 1.15;
+        private double coldStartMultiplier = 1.02;
         private int windowSize = 50;
-        private double marketMultiplier = 1.05;
-        private double premiumMultiplier = 1.5;
-        private double pacingBoost = 1.20;
+        private double marketMultiplier = 1.01;
+        private double premiumMultiplier = 1.05;
+        private double pacingBoost = 1.04;
         private double pacingCut = 0.85;
+        private double maxBudgetFraction = 0.02;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -62,6 +63,9 @@ public class BidderProperties {
 
         public double getPacingCut() { return pacingCut; }
         public void setPacingCut(double pacingCut) { this.pacingCut = pacingCut; }
+
+        public double getMaxBudgetFraction() { return maxBudgetFraction; }
+        public void setMaxBudgetFraction(double maxBudgetFraction) { this.maxBudgetFraction = maxBudgetFraction; }
     }
 
     public static class Competition {

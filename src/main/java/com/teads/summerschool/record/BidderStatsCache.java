@@ -340,7 +340,7 @@ public class BidderStatsCache {
 
     /**
      * Record a win for a targeting segment, updating aggregate stats.
-     * Called from Kafka consumer (async, not hot path).
+     * Also refreshes the in-memory cache so computeBidPrice sees fresh data immediately.
      */
     public Mono<Void> recordWinForSegment(String segmentKey, double clearingPrice, double ourBidPrice) {
         String key = segmentStatsKey(segmentKey);
@@ -350,12 +350,15 @@ public class BidderStatsCache {
                 List.of(String.valueOf(clearingPrice), String.valueOf(ourBidPrice))
         )
         .then()
-        .doOnSuccess(v -> log.debug("SEG-WIN  key={} clearing={}", key, clearingPrice));
+        .doOnSuccess(v -> {
+            log.debug("SEG-WIN  key={} clearing={}", key, clearingPrice);
+            updateCachedSegmentStats(segmentKey, true, clearingPrice, ourBidPrice);
+        });
     }
 
     /**
      * Record a loss for a targeting segment, updating aggregate stats.
-     * Called from Kafka consumer (async, not hot path).
+     * Also refreshes the in-memory cache so computeBidPrice sees fresh data immediately.
      */
     public Mono<Void> recordLossForSegment(String segmentKey, double ourBidPrice) {
         String key = segmentStatsKey(segmentKey);
@@ -365,7 +368,30 @@ public class BidderStatsCache {
                 List.of(String.valueOf(ourBidPrice))
         )
         .then()
-        .doOnSuccess(v -> log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice));
+        .doOnSuccess(v -> {
+            log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice);
+            updateCachedSegmentStats(segmentKey, false, 0.0, ourBidPrice);
+        });
+    }
+
+    private void updateCachedSegmentStats(String segmentKey, boolean won, double clearingPrice, double bidPrice) {
+        CachedSegmentStats existing = segmentStatsCache.get(segmentKey);
+        SegmentStats prev = (existing != null) ? existing.stats : SegmentStats.empty();
+
+        int newTotal = prev.totalAuctions() + 1;
+        int newWins = prev.totalWins() + (won ? 1 : 0);
+        double newWinRate = (double) newWins / newTotal;
+        double newAvgClearing = won
+            ? (prev.avgClearingPrice() * prev.totalWins() + clearingPrice) / newWins
+            : prev.avgClearingPrice();
+        int losses = newTotal - newWins;
+        int prevLosses = prev.totalAuctions() - prev.totalWins();
+        double newAvgLoss = !won
+            ? (prev.avgLossPrice() * prevLosses + bidPrice) / losses
+            : prev.avgLossPrice();
+
+        SegmentStats updated = new SegmentStats(newTotal, newWins, newAvgClearing, newWinRate, newAvgLoss);
+        segmentStatsCache.put(segmentKey, new CachedSegmentStats(updated));
     }
 
     // In-memory cache for segment stats with 10-second TTL
@@ -384,6 +410,22 @@ public class BidderStatsCache {
         boolean isExpired() {
             return System.currentTimeMillis() - timestamp > 10000; // 10 seconds TTL
         }
+    }
+
+    /**
+     * Synchronous, non-blocking read of cached segment stats.
+     * Returns the last known stats from in-memory cache, or empty stats if no data yet.
+     * The cache is populated asynchronously by the Kafka consumer via recordWinForSegment/recordLossForSegment,
+     * and refreshed by getSegmentStats() calls. This avoids any Redis round-trip on the hot bid path.
+     */
+    public SegmentStats getSegmentStatsCached(String segmentKey) {
+        CachedSegmentStats cached = segmentStatsCache.get(segmentKey);
+        if (cached != null) {
+            return cached.stats;
+        }
+        // Trigger async refresh for next time, return empty for now
+        getSegmentStats(segmentKey).subscribe();
+        return SegmentStats.empty();
     }
 
     /**
