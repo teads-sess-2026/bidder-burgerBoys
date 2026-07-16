@@ -8,10 +8,12 @@ import org.springframework.data.redis.core.ReactiveRedisTemplate;
 import org.springframework.data.redis.core.script.RedisScript;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -59,26 +61,8 @@ public class BidderStatsCache {
 
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
-    // KEYS[1] = budget key, ARGV[1] = default budget (lazy init), ARGV[2] = amount to reserve.
-    // Returns new remaining as a bulk string if reservation succeeded, or "-1" if insufficient.
-    // Uses INCRBYFLOAT(key, 0) for the reject path so the return type is always a bulk string
-    // (Lua integer -1 can't deserialize as Double via Spring Data Redis).
-    private static final RedisScript<String> RESERVE_BUDGET_SCRIPT = RedisScript.of("""
-            if redis.call('EXISTS', KEYS[1]) == 0 then
-                redis.call('SET', KEYS[1], ARGV[1])
-            end
-            local current = tonumber(redis.call('GET', KEYS[1]))
-            local amount = tonumber(ARGV[2])
-            if current < amount then
-                return '-1'
-            end
-            return redis.call('INCRBYFLOAT', KEYS[1], -amount)
-            """, String.class);
-
-    // KEYS[1] = budget key, ARGV[1] = amount to refund. Simple add-back, no guard needed.
-    private static final RedisScript<String> REFUND_BUDGET_SCRIPT = RedisScript.of("""
-            return redis.call('INCRBYFLOAT', KEYS[1], tonumber(ARGV[1]))
-            """, String.class);
+    // In-memory budget store: creativeId -> remaining budget (doubles stored as long bits for atomicity)
+    private final ConcurrentHashMap<String, double[]> budgets = new ConcurrentHashMap<>();
 
     private static final RedisScript<Void> RECORD_SEGMENT_WIN_SCRIPT = RedisScript.of("""
             redis.call('HINCRBY', KEYS[1], 'totalAuctions', 1)
@@ -98,24 +82,11 @@ public class BidderStatsCache {
 
     private final AtomicLong winCount = new AtomicLong(0);
     private final Deque<Double> recentWinPrices = new ArrayDeque<>();
+    private volatile double initialTotalBudget = 0.0;
+    // Cached total remaining budget — updated atomically on every reserve/refund
+    private volatile double cachedTotalRemaining = 0.0;
+    private final Object totalBudgetLock = new Object();
 
-    // In-memory budget cache with 2-second TTL for hot path
-    private final java.util.concurrent.ConcurrentHashMap<String, CachedBudget> budgetCache =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    private static class CachedBudget {
-        final double budget;
-        final long timestamp;
-
-        CachedBudget(double budget) {
-            this.budget = budget;
-            this.timestamp = System.currentTimeMillis();
-        }
-
-        boolean isExpired() {
-            return System.currentTimeMillis() - timestamp > 2000; // 2 seconds TTL
-        }
-    }
 
     public BidderStatsCache(BidderProperties properties, ReactiveRedisTemplate<String, String> redis,
                              CreativeRepository creativeRepository) {
@@ -162,66 +133,87 @@ public class BidderStatsCache {
 
     /** Set a creative's remaining budget to its full limit. Called once per creative on startup. */
     public Mono<Boolean> initBudget(String creativeId, double budget) {
+        budgets.put(creativeId, new double[]{budget});
+        synchronized (totalBudgetLock) {
+            initialTotalBudget += budget;
+            cachedTotalRemaining += budget;
+        }
+        log.info("Creative budget initialized in-memory: {} = {}", creativeId, budget);
         String key = budgetKey(creativeId);
         return redis.opsForValue().set(key, String.valueOf(budget))
-                .doOnNext(ok -> log.info("Creative budget initialized: {} = {}", key, budget));
+                .timeout(java.time.Duration.ofSeconds(2))
+                .doOnNext(ok -> log.debug("Budget synced to Redis: {} = {}", key, budget))
+                .onErrorResume(e -> {
+                    log.warn("Failed to sync initial budget to Redis for {} — SSP will see it on next reserve: {}",
+                            creativeId, e.getMessage());
+                    return Mono.just(true);
+                });
     }
 
     /**
      * Atomically reserve bidPrice from a creative's budget before placing a bid.
      * Returns the new remaining budget if reservation succeeded, or empty Mono if insufficient funds.
+     * Decision is in-memory (instant); Redis is updated async for SSP visibility.
      */
     public Mono<Double> reserveBudget(String creativeId, double bidPrice) {
-        String key = budgetKey(creativeId);
-        return redis.execute(RESERVE_BUDGET_SCRIPT,
-                        List.of(key),
-                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(bidPrice)))
-                .next()
-                .flatMap(raw -> {
-                    double result = Double.parseDouble(raw);
-                    if (result < 0) {
-                        budgetCache.put(creativeId, new CachedBudget(0.0));
-                        return Mono.<Double>empty();
-                    }
-                    budgetCache.put(creativeId, new CachedBudget(result));
-                    log.debug("RESERVE key={} amount={} remaining={}", key, bidPrice, result);
-                    return Mono.just(result);
-                });
+        double[] holder = budgets.computeIfAbsent(creativeId,
+                k -> new double[]{properties.getCreativeBudget()});
+
+        double remaining;
+        synchronized (holder) {
+            if (holder[0] < bidPrice) {
+                return Mono.empty();
+            }
+            holder[0] -= bidPrice;
+            remaining = holder[0];
+        }
+        synchronized (totalBudgetLock) {
+            cachedTotalRemaining -= bidPrice;
+        }
+        log.debug("RESERVE creative={} amount={} remaining={}", creativeId, bidPrice, remaining);
+        syncBudgetToRedis(creativeId, remaining);
+        return Mono.just(remaining);
     }
 
     /**
      * Refund a previously reserved amount back to the creative's budget (on loss or overpayment).
+     * In-memory is source of truth; Redis synced async for SSP visibility.
      */
     public Mono<Double> refundBudget(String creativeId, double amount) {
         if (amount <= 0) return Mono.just(0.0);
-        String key = budgetKey(creativeId);
-        return redis.execute(REFUND_BUDGET_SCRIPT,
-                        List.of(key),
-                        List.of(String.valueOf(amount)))
-                .next()
-                .map(Double::parseDouble)
-                .doOnNext(after -> {
-                    budgetCache.put(creativeId, new CachedBudget(after));
-                    log.debug("REFUND  key={} amount={} remaining={}", key, amount, after);
-                });
+        double[] holder = budgets.computeIfAbsent(creativeId,
+                k -> new double[]{properties.getCreativeBudget()});
+
+        double remaining;
+        synchronized (holder) {
+            holder[0] += amount;
+            remaining = holder[0];
+        }
+        synchronized (totalBudgetLock) {
+            cachedTotalRemaining += amount;
+        }
+        log.debug("REFUND  creative={} amount={} remaining={}", creativeId, amount, remaining);
+        syncBudgetToRedis(creativeId, remaining);
+        return Mono.just(remaining);
+    }
+
+    /** Fire-and-forget sync of current budget to Redis so the SSP can read it. */
+    private void syncBudgetToRedis(String creativeId, double remaining) {
+        redis.opsForValue().set(budgetKey(creativeId), String.valueOf(remaining))
+                .subscribe(null, err -> log.warn("Failed to sync budget to Redis for {}: {}",
+                        creativeId, err.getMessage()));
     }
 
     /**
-     * On win: refund the difference between reserved bidPrice and actual clearingPrice,
-     * then sync to Postgres.
+     * On win: refund the difference between reserved bidPrice and actual clearingPrice.
+     * Updates in-memory budget immediately and syncs to Postgres asynchronously.
      */
     public Mono<Double> recordWin(String creativeId, double clearingPrice, double bidPrice) {
         double refundAmount = bidPrice - clearingPrice;
         return refundBudget(creativeId, refundAmount)
-                .doOnNext(after -> log.info("BUDGET  key={} clearing={} refund={} remaining={}",
-                        budgetKey(creativeId), clearingPrice, refundAmount, after))
-                .flatMap(after -> creativeRepository.findById(creativeId)
-                        .flatMap(c -> {
-                            c.setBudget(after);
-                            return creativeRepository.save(c);
-                        })
-                        .thenReturn(after))
                 .doOnNext(after -> {
+                    log.info("BUDGET  creative={} clearing={} refund={} remaining={}",
+                            creativeId, clearingPrice, refundAmount, after);
                     winCount.incrementAndGet();
                     synchronized (recentWinPrices) {
                         recentWinPrices.addLast(clearingPrice);
@@ -229,102 +221,103 @@ public class BidderStatsCache {
                             recentWinPrices.pollFirst();
                         }
                     }
+                    // Async Postgres sync — fire-and-forget so it doesn't block the hot path
+                    final double remaining = after;
+                    creativeRepository.findById(creativeId)
+                            .flatMap(c -> {
+                                c.setBudget(remaining);
+                                return creativeRepository.save(c);
+                            })
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .subscribe(
+                                    ok -> {},
+                                    err -> log.warn("Failed to sync budget to Postgres for {}: {}",
+                                            creativeId, err.getMessage())
+                            );
                 });
     }
 
     /**
      * On loss: refund the entire reserved bidPrice back to the creative's budget.
+     * Updates in-memory immediately and syncs to Postgres asynchronously.
      */
     public Mono<Double> recordLoss(String creativeId, double bidPrice) {
         return refundBudget(creativeId, bidPrice)
-                .doOnNext(after -> log.info("LOSS-REFUND key={} refund={} remaining={}",
-                        budgetKey(creativeId), bidPrice, after))
-                .flatMap(after -> creativeRepository.findById(creativeId)
-                        .flatMap(c -> {
-                            c.setBudget(after);
-                            return creativeRepository.save(c);
-                        })
-                        .thenReturn(after));
+                .doOnNext(after -> {
+                    log.info("LOSS-REFUND creative={} refund={} remaining={}", creativeId, bidPrice, after);
+                    // Async Postgres sync
+                    final double remaining = after;
+                    creativeRepository.findById(creativeId)
+                            .flatMap(c -> {
+                                c.setBudget(remaining);
+                                return creativeRepository.save(c);
+                            })
+                            .subscribeOn(Schedulers.boundedElastic())
+                            .subscribe(
+                                    ok -> {},
+                                    err -> log.warn("Failed to sync budget to Postgres for {}: {}",
+                                            creativeId, err.getMessage())
+                            );
+                });
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */
     public Mono<Double> getRemainingBudget(String creativeId) {
-        String key = budgetKey(creativeId);
-        double defaultBudget = properties.getCreativeBudget();
-        return redis.opsForValue().get(key)
-                .flatMap(val -> {
-                    try {
-                        return Mono.just(Double.parseDouble(val));
-                    } catch (NumberFormatException e) {
-                        return Mono.just(defaultBudget);
-                    }
-                })
-                .switchIfEmpty(redis.opsForValue().setIfAbsent(key, String.valueOf(defaultBudget))
-                        .thenReturn(defaultBudget));
+        double[] holder = budgets.computeIfAbsent(creativeId,
+                k -> new double[]{properties.getCreativeBudget()});
+        synchronized (holder) {
+            return Mono.just(holder[0]);
+        }
     }
 
     /**
-     * Batch check remaining budgets for multiple creatives using in-memory cache first, then MGET.
-     * Returns a map of creativeId -> remainingBudget.
-     * HOT PATH: must complete in <10ms for typical creative counts (2-4).
+     * Batch check remaining budgets for multiple creatives.
+     * Fully in-memory — O(1) per creative, no Redis round trip.
      */
     public Mono<java.util.Map<String, Double>> getRemainingBudgets(List<String> creativeIds) {
         if (creativeIds.isEmpty()) {
             return Mono.just(java.util.Map.of());
         }
 
-        java.util.Map<String, Double> result = new java.util.HashMap<>();
-        List<String> needsFetch = new java.util.ArrayList<>();
-
-        // Fast path: check in-memory cache
+        double defaultBudget = properties.getCreativeBudget();
+        java.util.Map<String, Double> result = new java.util.HashMap<>(creativeIds.size());
         for (String creativeId : creativeIds) {
-            CachedBudget cached = budgetCache.get(creativeId);
-            if (cached != null && !cached.isExpired()) {
-                result.put(creativeId, cached.budget);
-            } else {
-                needsFetch.add(creativeId);
+            double[] holder = budgets.computeIfAbsent(creativeId, k -> new double[]{defaultBudget});
+            synchronized (holder) {
+                result.put(creativeId, holder[0]);
             }
         }
+        return Mono.just(result);
+    }
 
-        // If all found in cache, return immediately
-        if (needsFetch.isEmpty()) {
-            return Mono.just(result);
+    /** Total remaining budget across all creatives. Fully in-memory, no I/O. */
+    public double getTotalRemainingBudget() {
+        double total = 0.0;
+        for (double[] holder : budgets.values()) {
+            synchronized (holder) {
+                total += holder[0];
+            }
         }
+        return total;
+    }
 
-        // Slow path: fetch missing budgets from Redis
-        double defaultBudget = properties.getCreativeBudget();
-        List<String> keys = needsFetch.stream().map(this::budgetKey).toList();
+    /** O(1) cached total remaining budget — updated on every reserve/refund. Use on hot path. */
+    public double getCachedTotalRemainingBudget() {
+        return cachedTotalRemaining;
+    }
 
-        return redis.opsForValue().multiGet(keys)
-            .map(values -> {
-                for (int i = 0; i < needsFetch.size(); i++) {
-                    String creativeId = needsFetch.get(i);
-                    String value = values != null && i < values.size() ? values.get(i) : null;
+    /** Synchronous O(1) read of a single creative's remaining budget. */
+    public double getCachedRemainingBudget(String creativeId) {
+        double[] holder = budgets.computeIfAbsent(creativeId,
+                k -> new double[]{properties.getCreativeBudget()});
+        synchronized (holder) {
+            return holder[0];
+        }
+    }
 
-                    double budget;
-                    if (value != null) {
-                        try {
-                            budget = Double.parseDouble(value);
-                        } catch (NumberFormatException e) {
-                            budget = defaultBudget;
-                        }
-                    } else {
-                        budget = defaultBudget;
-                    }
-
-                    result.put(creativeId, budget);
-                    budgetCache.put(creativeId, new CachedBudget(budget));
-                }
-                return result;
-            })
-            .defaultIfEmpty(result)
-            .map(map -> {
-                // Fill in defaults for any still missing
-                for (String id : needsFetch) {
-                    map.putIfAbsent(id, defaultBudget);
-                }
-                return map;
-            });
+    /** Total budget at startup across all creatives (sum of all initBudget calls). */
+    public double getInitialTotalBudget() {
+        return initialTotalBudget;
     }
 
     public long getWinCount() {
@@ -379,23 +372,61 @@ public class BidderStatsCache {
     }
 
     private void updateCachedSegmentStats(String segmentKey, boolean won, double clearingPrice, double bidPrice) {
-        CachedSegmentStats existing = segmentStatsCache.get(segmentKey);
-        SegmentStats prev = (existing != null) ? existing.stats : SegmentStats.empty();
-
-        int newTotal = prev.totalAuctions() + 1;
-        int newWins = prev.totalWins() + (won ? 1 : 0);
-        double newWinRate = (double) newWins / newTotal;
-        double newAvgClearing = won
-            ? (prev.avgClearingPrice() * prev.totalWins() + clearingPrice) / newWins
-            : prev.avgClearingPrice();
-        int losses = newTotal - newWins;
-        int prevLosses = prev.totalAuctions() - prev.totalWins();
-        double newAvgLoss = !won
-            ? (prev.avgLossPrice() * prevLosses + bidPrice) / losses
-            : prev.avgLossPrice();
-
-        SegmentStats updated = new SegmentStats(newTotal, newWins, newAvgClearing, newWinRate, newAvgLoss);
+        SegmentWindow window = segmentWindows.computeIfAbsent(segmentKey,
+                k -> new SegmentWindow(properties.getStrategy().getWindowSize()));
+        SegmentStats updated;
+        synchronized (window) {
+            window.add(won, clearingPrice, bidPrice);
+            updated = window.toStats();
+        }
         segmentStatsCache.put(segmentKey, new CachedSegmentStats(updated));
+    }
+
+    // Rolling window of recent auction results per segment for windowed win-rate calculation
+    private final ConcurrentHashMap<String, SegmentWindow> segmentWindows = new ConcurrentHashMap<>();
+
+    private static class SegmentWindow {
+        private final boolean[] wins;
+        private final double[] clearingPrices;
+        private final double[] bidPrices;
+        private final int capacity;
+        private int head = 0;
+        private int count = 0;
+
+        SegmentWindow(int capacity) {
+            this.capacity = capacity;
+            this.wins = new boolean[capacity];
+            this.clearingPrices = new double[capacity];
+            this.bidPrices = new double[capacity];
+        }
+
+        void add(boolean won, double clearingPrice, double bidPrice) {
+            wins[head] = won;
+            clearingPrices[head] = clearingPrice;
+            bidPrices[head] = bidPrice;
+            head = (head + 1) % capacity;
+            if (count < capacity) count++;
+        }
+
+        SegmentStats toStats() {
+            if (count == 0) return SegmentStats.empty();
+            int totalWins = 0;
+            double sumClearing = 0.0;
+            double sumLossBids = 0.0;
+            for (int i = 0; i < count; i++) {
+                if (wins[i]) {
+                    totalWins++;
+                    sumClearing += clearingPrices[i];
+                } else {
+                    sumLossBids += bidPrices[i];
+                }
+            }
+            double winRate = (double) totalWins / count;
+            double avgClearing = totalWins > 0 ? sumClearing / totalWins : 0.0;
+            int losses = count - totalWins;
+            double avgLoss = losses > 0 ? sumLossBids / losses : 0.0;
+            return new SegmentStats(count, totalWins, avgClearing, winRate, avgLoss);
+        }
     }
 
     // In-memory cache for segment stats with 10-second TTL

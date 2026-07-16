@@ -18,11 +18,13 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.Random;
 
 @Service
@@ -42,6 +44,7 @@ public class BiddingService {
     // Last successfully computed budget.remaining, served when a scrape's
     // computation times out instead of blocking the scrape thread forever.
     private volatile double lastKnownBudget = 0.0;
+
 
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
@@ -93,6 +96,11 @@ public class BiddingService {
 
         BidRecord record = buildRecord(request);
 
+        // Short-circuit if competition is over
+        if (getPacingMultiplier() == 0.0) {
+            return finishNoBid(record, "competition_over", startTime);
+        }
+
         return creativeCache.getAll()
             .collectList()
             .flatMap(allCreatives -> {
@@ -130,22 +138,13 @@ public class BiddingService {
                             return finishNoBid(record, "budget_exhausted", startTime);
                         }
 
-                        // LAYER 4: Value-based skip — don't blow too much budget on one auction
-                        double maxAffordable = layer3.stream()
-                            .mapToDouble(c -> budgetMap.getOrDefault(c.getId(), 0.0))
-                            .max().orElse(0.0)
-                            * properties.getStrategy().getMaxBudgetFraction();
-                        if (request.floorPrice() > maxAffordable) {
-                            return finishNoBid(record, "too_expensive", startTime);
-                        }
-
-                        // LAYER 5: Rank creatives by specificity + maxBidPrice, try in order (fallback)
+                        // LAYER 4: Rank creatives by specificity + maxBidPrice, try in order (fallback)
                         List<Creative> ranked = rankCreatives(layer3);
 
-                        // LAYER 6: Compute bid price with stats-based shading
+                        // LAYER 5: Compute bid price with stats-based shading
                         double bidPrice = computeBidPrice(request, ranked.get(0));
 
-                        // LAYER 7: Try each creative in ranked order until one has budget
+                        // LAYER 6: Try each creative in ranked order until one has budget
                         return tryReserveInOrder(ranked, bidPrice, request, record, startTime);
                     });
             });
@@ -163,7 +162,11 @@ public class BiddingService {
 
         for (int i = ranked.size() - 1; i >= 0; i--) {
             final Creative candidate = ranked.get(i);
-            final double candidateBid = enforceConstraints(bidPrice, request.floorPrice(), candidate);
+            OptionalDouble constrained = enforceConstraints(bidPrice, request.floorPrice(), candidate);
+            if (constrained.isEmpty()) {
+                continue;
+            }
+            final double candidateBid = constrained.getAsDouble();
             final Mono<Optional<BidResponse>> fallback = chain;
 
             chain = statsCache.reserveBudget(candidate.getId(), candidateBid)
@@ -172,17 +175,22 @@ public class BiddingService {
                     record.setCreativeId(candidate.getId());
                     record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
 
-                    ownBidCache.record(request.requestId(), candidate.getId(), candidateBid);
+                    ownBidCache.record(request.requestId(), candidate.getId(), candidateBid,
+                        request.targeting() != null ? request.targeting().geo() : null,
+                        request.targeting() != null ? request.targeting().deviceType() : null,
+                        request.targeting() != null ? request.targeting().audienceSegment() : null);
 
                     metrics.recordBid();
                     metrics.recordLatency(record.getLatencyMs());
 
-                    return bidRecordRepository.save(record)
-                        .thenReturn(Optional.of(new BidResponse(
+                    // Fire-and-forget: don't block the bid response on Postgres write
+                    bidRecordRepository.save(record).subscribe();
+
+                    return Mono.just(Optional.of(new BidResponse(
                             request.requestId(),
                             candidateBid,
                             toCreativeDto(candidate)
-                        )));
+                    )));
                 })
                 .switchIfEmpty(Mono.defer(() -> fallback));
         }
@@ -191,14 +199,15 @@ public class BiddingService {
     }
 
     /**
-     * Finish with no-bid: set reason, record metrics, save to DB.
+     * Finish with no-bid: set reason, record metrics, save to DB (fire-and-forget).
      */
     private Mono<Optional<BidResponse>> finishNoBid(BidRecord record, String reason, long startTime) {
         record.setNoBidReason(reason);
         record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
         metrics.recordNoBid(reason);
         metrics.recordLatency(record.getLatencyMs());
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+        bidRecordRepository.save(record).subscribe();
+        return Mono.just(Optional.empty());
     }
 
     /**
@@ -236,9 +245,74 @@ public class BiddingService {
     }
 
     /**
+     * Returns a pacing multiplier based on how much time vs budget has been consumed.
+     * > 1.0 means we're behind pace (spend more aggressively),
+     * < 1.0 means we're ahead of pace (be more selective / bid lower).
+     * Returns 1.0 if pacing is disabled (no startTime configured).
+     */
+    private double getPacingMultiplier() {
+        BidderProperties.Competition comp = properties.getCompetition();
+        if (comp == null || comp.getStartTime() == null || comp.getStartTime().isBlank()) {
+            return 1.0;
+        }
+
+        Instant start;
+        try {
+            start = Instant.parse(comp.getStartTime());
+        } catch (Exception e) {
+            return 1.0;
+        }
+
+        long durationMs = comp.getDurationSeconds() * 1000;
+        long elapsed = System.currentTimeMillis() - start.toEpochMilli();
+
+        if (elapsed <= 0) return 1.0; // competition hasn't started
+        if (elapsed >= durationMs) return 0.0; // competition is over, stop spending
+
+        double timeFraction = (double) elapsed / durationMs;
+        double initialBudget = statsCache.getInitialTotalBudget();
+        if (initialBudget <= 0) return 1.0;
+        double remaining = statsCache.getCachedTotalRemainingBudget();
+        double spent = initialBudget - remaining;
+        double budgetFraction = spent / initialBudget;
+
+        // ratio > 1 means spending faster than time is passing (ahead of pace)
+        // ratio < 1 means spending slower than time (behind pace)
+        double ratio = (timeFraction > 0) ? budgetFraction / timeFraction : 0.0;
+
+        // Urgency: in the last 20% of time, if we still have significant budget left, be aggressive
+        double urgency = 1.0;
+        if (timeFraction > 0.8) {
+            double budgetRemaining = 1.0 - budgetFraction;
+            urgency = 1.0 + budgetRemaining * (timeFraction / 1.0);
+        }
+        // Cap urgency to prevent overpay storms in endgame
+        urgency = Math.min(urgency, 1.3);
+
+        double pacingFactor;
+        if (ratio > 1.3) {
+            pacingFactor = properties.getStrategy().getPacingCut();
+        } else if (ratio > 1.1) {
+            // Slightly ahead — mild cut
+            pacingFactor = 0.95;
+        } else if (ratio < 0.5) {
+            // Far behind pace — strong boost
+            pacingFactor = 1.15;
+        } else if (ratio < 0.8) {
+            // Behind pace — moderate boost
+            pacingFactor = 1.08;
+        } else {
+            pacingFactor = 1.0;
+        }
+
+        return pacingFactor * urgency;
+    }
+
+    /**
      * Compute bid price using stats-based shading for first-price auctions.
      * In first-price, you pay exactly what you bid — so the optimal bid is the
-     * minimum needed to win. Uses in-memory cached segment stats (no Redis call on hot path).
+     * minimum needed to win. Uses observed clearing/loss prices to anchor bids to
+     * actual market levels instead of blindly scaling the floor.
      */
     private double computeBidPrice(BidRequest request, Creative creative) {
         double floorPrice = request.floorPrice();
@@ -252,30 +326,48 @@ public class BiddingService {
 
         BidderStatsCache.SegmentStats stats = statsCache.getSegmentStatsCached(segmentKey);
 
-        double multiplier;
+        double bid;
         if (stats.totalAuctions() < strategy.getMinSamples()) {
-            multiplier = strategy.getColdStartMultiplier();
+            // Cold start: no market data yet, bid aggressively to win early and gather data
+            bid = floorPrice * strategy.getColdStartMultiplier();
         } else if (stats.winRate() > 0.60) {
-            // Winning too easily — shade down aggressively to save budget
-            multiplier = strategy.getMarketMultiplier();
+            // Winning too easily — shade down toward observed clearing prices to save budget
+            double target = stats.avgClearingPrice() > 0
+                ? stats.avgClearingPrice() * strategy.getMarketMultiplier()
+                : floorPrice * strategy.getMarketMultiplier();
+            bid = Math.max(target, floorPrice + 0.01);
         } else if (stats.winRate() < 0.30) {
-            // Losing too much — bid higher to be competitive
-            multiplier = strategy.getPacingBoost();
+            // Losing too much — bid significantly above our losing bids
+            double lossReference = stats.avgLossPrice() > 0 ? stats.avgLossPrice() : floorPrice;
+            bid = lossReference * 1.20;
         } else {
-            // Healthy win rate — bid just above floor
-            multiplier = strategy.getColdStartMultiplier();
+            // Healthy win rate (30-60%) — bid just above observed clearing to stay competitive
+            double target = stats.avgClearingPrice() > 0
+                ? stats.avgClearingPrice() * 1.05
+                : floorPrice * strategy.getColdStartMultiplier();
+            bid = Math.max(target, floorPrice + 0.01);
+        }
+
+        // Apply pacing: shade bids down if ahead of budget pace, up if behind
+        bid *= getPacingMultiplier();
+
+        // Cap per-bid spend to maxBudgetFraction of remaining budget
+        double remaining = statsCache.getCachedRemainingBudget(creative.getId());
+        double maxAllowed = remaining * strategy.getMaxBudgetFraction();
+        if (maxAllowed > floorPrice) {
+            bid = Math.min(bid, maxAllowed);
         }
 
         // 5% exploration: small random offset to discover price sensitivity
         if (random.nextDouble() < 0.05) {
-            multiplier += (random.nextDouble() - 0.5) * 0.04; // ±2% jitter
+            double jitter = (random.nextDouble() - 0.5) * 0.04 * bid;
+            bid += jitter;
         }
 
-        double bid = floorPrice * multiplier;
-        return enforceConstraints(bid, floorPrice, creative);
+        return enforceConstraints(bid, floorPrice, creative).orElse(floorPrice + 0.01);
     }
 
-    private double enforceConstraints(double bid, double floorPrice, Creative creative) {
+    private OptionalDouble enforceConstraints(double bid, double floorPrice, Creative creative) {
         // Must exceed floor
         bid = Math.max(bid, floorPrice + 0.01);
 
@@ -284,7 +376,12 @@ public class BiddingService {
             bid = Math.min(bid, creative.getMaxBidPrice());
         }
 
-        return bid;
+        // Constraints are unsatisfiable if the cap pushed us at or below the floor
+        if (bid <= floorPrice) {
+            return OptionalDouble.empty();
+        }
+
+        return OptionalDouble.of(bid);
     }
 
     /** Total remaining budget across all this bidder's creatives. */
