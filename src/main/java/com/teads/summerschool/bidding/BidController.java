@@ -4,6 +4,7 @@ import com.teads.summerschool.bidding.dto.BidRequest;
 import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.geolocation.GeolocationService;
 import com.teads.summerschool.geolocation.dto.GeolocationInfo;
+import com.teads.summerschool.metrics.BidderMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -23,13 +24,16 @@ public class BidController {
     private final BiddingService biddingService;
     private final BidderProperties properties;
     private final Optional<GeolocationService> geolocationService;
+    private final BidderMetrics metrics;
 
     public BidController(BiddingService biddingService,
                         BidderProperties properties,
-                        @Autowired(required = false) GeolocationService geolocationService) {
+                        @Autowired(required = false) GeolocationService geolocationService,
+                        BidderMetrics metrics) {
         this.biddingService = biddingService;
         this.properties = properties;
         this.geolocationService = Optional.ofNullable(geolocationService);
+        this.metrics = metrics;
     }
 
     @PostMapping("/api/bid")
@@ -47,6 +51,7 @@ public class BidController {
                     Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
                     log.warn("<< BID TIMEOUT  id={} — {}: {}", request.requestId(),
                             cause.getClass().getSimpleName(), cause.getMessage(), cause);
+                    metrics.recordNoBid("timeout");
                     return Mono.just(ResponseEntity.noContent().build());
                 });
     }
