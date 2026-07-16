@@ -59,16 +59,26 @@ public class BidderStatsCache {
 
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
-    // KEYS[1] = budget key, ARGV[1] = default budget (used only if the key doesn't exist yet),
-    // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
-    // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
-    // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
+    // KEYS[1] = budget key, ARGV[1] = default budget (lazy init), ARGV[2] = amount to reserve.
+    // Returns new remaining as a bulk string if reservation succeeded, or "-1" if insufficient.
+    // Uses INCRBYFLOAT(key, 0) for the reject path so the return type is always a bulk string
+    // (Lua integer -1 can't deserialize as Double via Spring Data Redis).
+    private static final RedisScript<String> RESERVE_BUDGET_SCRIPT = RedisScript.of("""
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
-            return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
-            """, Double.class);
+            local current = tonumber(redis.call('GET', KEYS[1]))
+            local amount = tonumber(ARGV[2])
+            if current < amount then
+                return '-1'
+            end
+            return redis.call('INCRBYFLOAT', KEYS[1], -amount)
+            """, String.class);
+
+    // KEYS[1] = budget key, ARGV[1] = amount to refund. Simple add-back, no guard needed.
+    private static final RedisScript<String> REFUND_BUDGET_SCRIPT = RedisScript.of("""
+            return redis.call('INCRBYFLOAT', KEYS[1], tonumber(ARGV[1]))
+            """, String.class);
 
     private static final RedisScript<Void> RECORD_SEGMENT_WIN_SCRIPT = RedisScript.of("""
             redis.call('HINCRBY', KEYS[1], 'totalAuctions', 1)
@@ -157,14 +167,54 @@ public class BidderStatsCache {
                 .doOnNext(ok -> log.info("Creative budget initialized: {} = {}", key, budget));
     }
 
-    /** Decrement the winning creative's remaining budget by what it paid. */
-    public Mono<Double> recordWin(String creativeId, double clearingPrice) {
+    /**
+     * Atomically reserve bidPrice from a creative's budget before placing a bid.
+     * Returns the new remaining budget if reservation succeeded, or empty Mono if insufficient funds.
+     */
+    public Mono<Double> reserveBudget(String creativeId, double bidPrice) {
         String key = budgetKey(creativeId);
-        return redis.execute(RECORD_WIN_SCRIPT,
+        return redis.execute(RESERVE_BUDGET_SCRIPT,
                         List.of(key),
-                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
+                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(bidPrice)))
                 .next()
-                .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
+                .flatMap(raw -> {
+                    double result = Double.parseDouble(raw);
+                    if (result < 0) {
+                        budgetCache.put(creativeId, new CachedBudget(0.0));
+                        return Mono.<Double>empty();
+                    }
+                    budgetCache.put(creativeId, new CachedBudget(result));
+                    log.debug("RESERVE key={} amount={} remaining={}", key, bidPrice, result);
+                    return Mono.just(result);
+                });
+    }
+
+    /**
+     * Refund a previously reserved amount back to the creative's budget (on loss or overpayment).
+     */
+    public Mono<Double> refundBudget(String creativeId, double amount) {
+        if (amount <= 0) return Mono.just(0.0);
+        String key = budgetKey(creativeId);
+        return redis.execute(REFUND_BUDGET_SCRIPT,
+                        List.of(key),
+                        List.of(String.valueOf(amount)))
+                .next()
+                .map(Double::parseDouble)
+                .doOnNext(after -> {
+                    budgetCache.put(creativeId, new CachedBudget(after));
+                    log.debug("REFUND  key={} amount={} remaining={}", key, amount, after);
+                });
+    }
+
+    /**
+     * On win: refund the difference between reserved bidPrice and actual clearingPrice,
+     * then sync to Postgres.
+     */
+    public Mono<Double> recordWin(String creativeId, double clearingPrice, double bidPrice) {
+        double refundAmount = bidPrice - clearingPrice;
+        return refundBudget(creativeId, refundAmount)
+                .doOnNext(after -> log.info("BUDGET  key={} clearing={} refund={} remaining={}",
+                        budgetKey(creativeId), clearingPrice, refundAmount, after))
                 .flatMap(after -> creativeRepository.findById(creativeId)
                         .flatMap(c -> {
                             c.setBudget(after);
@@ -172,9 +222,6 @@ public class BidderStatsCache {
                         })
                         .thenReturn(after))
                 .doOnNext(after -> {
-                    // Update in-memory budget cache
-                    budgetCache.put(creativeId, new CachedBudget(after));
-
                     winCount.incrementAndGet();
                     synchronized (recentWinPrices) {
                         recentWinPrices.addLast(clearingPrice);
@@ -183,6 +230,21 @@ public class BidderStatsCache {
                         }
                     }
                 });
+    }
+
+    /**
+     * On loss: refund the entire reserved bidPrice back to the creative's budget.
+     */
+    public Mono<Double> recordLoss(String creativeId, double bidPrice) {
+        return refundBudget(creativeId, bidPrice)
+                .doOnNext(after -> log.info("LOSS-REFUND key={} refund={} remaining={}",
+                        budgetKey(creativeId), bidPrice, after))
+                .flatMap(after -> creativeRepository.findById(creativeId)
+                        .flatMap(c -> {
+                            c.setBudget(after);
+                            return creativeRepository.save(c);
+                        })
+                        .thenReturn(after));
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */
@@ -282,7 +344,7 @@ public class BidderStatsCache {
 
     /**
      * Record a win for a targeting segment, updating aggregate stats.
-     * Called from Kafka consumer (async, not hot path).
+     * Also refreshes the in-memory cache so computeBidPrice sees fresh data immediately.
      */
     public Mono<Void> recordWinForSegment(String segmentKey, double clearingPrice, double ourBidPrice) {
         String key = segmentStatsKey(segmentKey);
@@ -292,12 +354,15 @@ public class BidderStatsCache {
                 List.of(String.valueOf(clearingPrice), String.valueOf(ourBidPrice))
         )
         .then()
-        .doOnSuccess(v -> log.debug("SEG-WIN  key={} clearing={}", key, clearingPrice));
+        .doOnSuccess(v -> {
+            log.debug("SEG-WIN  key={} clearing={}", key, clearingPrice);
+            updateCachedSegmentStats(segmentKey, true, clearingPrice, ourBidPrice);
+        });
     }
 
     /**
      * Record a loss for a targeting segment, updating aggregate stats.
-     * Called from Kafka consumer (async, not hot path).
+     * Also refreshes the in-memory cache so computeBidPrice sees fresh data immediately.
      */
     public Mono<Void> recordLossForSegment(String segmentKey, double ourBidPrice) {
         String key = segmentStatsKey(segmentKey);
@@ -307,7 +372,30 @@ public class BidderStatsCache {
                 List.of(String.valueOf(ourBidPrice))
         )
         .then()
-        .doOnSuccess(v -> log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice));
+        .doOnSuccess(v -> {
+            log.debug("SEG-LOSS key={} bid={}", key, ourBidPrice);
+            updateCachedSegmentStats(segmentKey, false, 0.0, ourBidPrice);
+        });
+    }
+
+    private void updateCachedSegmentStats(String segmentKey, boolean won, double clearingPrice, double bidPrice) {
+        CachedSegmentStats existing = segmentStatsCache.get(segmentKey);
+        SegmentStats prev = (existing != null) ? existing.stats : SegmentStats.empty();
+
+        int newTotal = prev.totalAuctions() + 1;
+        int newWins = prev.totalWins() + (won ? 1 : 0);
+        double newWinRate = (double) newWins / newTotal;
+        double newAvgClearing = won
+            ? (prev.avgClearingPrice() * prev.totalWins() + clearingPrice) / newWins
+            : prev.avgClearingPrice();
+        int losses = newTotal - newWins;
+        int prevLosses = prev.totalAuctions() - prev.totalWins();
+        double newAvgLoss = !won
+            ? (prev.avgLossPrice() * prevLosses + bidPrice) / losses
+            : prev.avgLossPrice();
+
+        SegmentStats updated = new SegmentStats(newTotal, newWins, newAvgClearing, newWinRate, newAvgLoss);
+        segmentStatsCache.put(segmentKey, new CachedSegmentStats(updated));
     }
 
     // In-memory cache for segment stats with 10-second TTL
@@ -326,6 +414,22 @@ public class BidderStatsCache {
         boolean isExpired() {
             return System.currentTimeMillis() - timestamp > 10000; // 10 seconds TTL
         }
+    }
+
+    /**
+     * Synchronous, non-blocking read of cached segment stats.
+     * Returns the last known stats from in-memory cache, or empty stats if no data yet.
+     * The cache is populated asynchronously by the Kafka consumer via recordWinForSegment/recordLossForSegment,
+     * and refreshed by getSegmentStats() calls. This avoids any Redis round-trip on the hot bid path.
+     */
+    public SegmentStats getSegmentStatsCached(String segmentKey) {
+        CachedSegmentStats cached = segmentStatsCache.get(segmentKey);
+        if (cached != null) {
+            return cached.stats;
+        }
+        // Trigger async refresh for next time, return empty for now
+        getSegmentStats(segmentKey).subscribe();
+        return SegmentStats.empty();
     }
 
     /**

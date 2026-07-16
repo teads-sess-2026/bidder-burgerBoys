@@ -15,7 +15,6 @@ import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
-import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
@@ -119,41 +118,76 @@ public class BiddingService {
                     return finishNoBid(record, "targeting_miss", startTime);
                 }
 
-                // LAYER 3: Budget filter (Redis - batch check all at once)
+                // LAYER 3: Budget pre-filter (in-memory cache - fast reject of known-exhausted)
                 List<String> creativeIds = layer2.stream().map(Creative::getId).toList();
                 return statsCache.getRemainingBudgets(creativeIds)
-                    .map(budgetMap -> layer2.stream()
-                        .filter(c -> budgetMap.getOrDefault(c.getId(), 0.0) > 0)
-                        .toList())
-                    .flatMap(layer3 -> {
+                    .flatMap(budgetMap -> {
+                        List<Creative> layer3 = layer2.stream()
+                            .filter(c -> budgetMap.getOrDefault(c.getId(), 0.0) > 0)
+                            .toList();
+
                         if (layer3.isEmpty()) {
                             return finishNoBid(record, "budget_exhausted", startTime);
                         }
 
-                        // LAYER 4: Select best creative by specificity + maxBidPrice tiebreak
-                        Creative selected = selectBestCreative(layer3);
+                        // LAYER 4: Value-based skip — don't blow too much budget on one auction
+                        double maxAffordable = layer3.stream()
+                            .mapToDouble(c -> budgetMap.getOrDefault(c.getId(), 0.0))
+                            .max().orElse(0.0)
+                            * properties.getStrategy().getMaxBudgetFraction();
+                        if (request.floorPrice() > maxAffordable) {
+                            return finishNoBid(record, "too_expensive", startTime);
+                        }
 
-                        // LAYER 5: Compute bid price and return response
-                        double bidPrice = computeBidPrice(request, selected);
+                        // LAYER 5: Rank creatives by specificity + maxBidPrice, try in order (fallback)
+                        List<Creative> ranked = rankCreatives(layer3);
 
-                        record.setBidPrice(bidPrice);
-                        record.setCreativeId(selected.getId());
-                        record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
+                        // LAYER 6: Compute bid price with stats-based shading
+                        double bidPrice = computeBidPrice(request, ranked.get(0));
 
-                        // Record in OwnBidCache for Kafka consumer
-                        ownBidCache.record(request.requestId(), selected.getId(), bidPrice);
-
-                        metrics.recordBid();
-                        metrics.recordLatency(record.getLatencyMs());
-
-                        return bidRecordRepository.save(record)
-                            .thenReturn(Optional.of(new BidResponse(
-                                request.requestId(),
-                                bidPrice,
-                                toCreativeDto(selected)
-                            )));
+                        // LAYER 7: Try each creative in ranked order until one has budget
+                        return tryReserveInOrder(ranked, bidPrice, request, record, startTime);
                     });
             });
+    }
+
+    /**
+     * Try to reserve budget from creatives in ranked order. If the top pick is exhausted,
+     * fall back to the next one instead of giving up.
+     */
+    private Mono<Optional<BidResponse>> tryReserveInOrder(
+            List<Creative> ranked, double bidPrice, BidRequest request, BidRecord record, long startTime) {
+
+        Mono<Optional<BidResponse>> chain = Mono.defer(() ->
+            finishNoBid(record, "budget_exhausted", startTime));
+
+        for (int i = ranked.size() - 1; i >= 0; i--) {
+            final Creative candidate = ranked.get(i);
+            final double candidateBid = enforceConstraints(bidPrice, request.floorPrice(), candidate);
+            final Mono<Optional<BidResponse>> fallback = chain;
+
+            chain = statsCache.reserveBudget(candidate.getId(), candidateBid)
+                .flatMap(remaining -> {
+                    record.setBidPrice(candidateBid);
+                    record.setCreativeId(candidate.getId());
+                    record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
+
+                    ownBidCache.record(request.requestId(), candidate.getId(), candidateBid);
+
+                    metrics.recordBid();
+                    metrics.recordLatency(record.getLatencyMs());
+
+                    return bidRecordRepository.save(record)
+                        .thenReturn(Optional.of(new BidResponse(
+                            request.requestId(),
+                            candidateBid,
+                            toCreativeDto(candidate)
+                        )));
+                })
+                .switchIfEmpty(Mono.defer(() -> fallback));
+        }
+
+        return chain;
     }
 
     /**
@@ -168,26 +202,25 @@ public class BiddingService {
     }
 
     /**
-     * Select best creative from survivors using:
+     * Rank creatives from best to worst using:
      * 1. Specificity score (higher = more targeted)
      * 2. Tiebreak by maxBidPrice descending (null treated as 0)
      */
-    private Creative selectBestCreative(List<Creative> creatives) {
+    private List<Creative> rankCreatives(List<Creative> creatives) {
         return creatives.stream()
-            .max((c1, c2) -> {
+            .sorted((c1, c2) -> {
                 int spec1 = computeSpecificity(c1);
                 int spec2 = computeSpecificity(c2);
 
                 if (spec1 != spec2) {
-                    return Integer.compare(spec1, spec2);
+                    return Integer.compare(spec2, spec1); // descending
                 }
 
-                // Tiebreak by maxBidPrice descending (null = 0)
                 double max1 = c1.getMaxBidPrice() != null ? c1.getMaxBidPrice() : 0.0;
                 double max2 = c2.getMaxBidPrice() != null ? c2.getMaxBidPrice() : 0.0;
-                return Double.compare(max1, max2);
+                return Double.compare(max2, max1); // descending
             })
-            .orElseThrow(() -> new IllegalStateException("selectBestCreative called with empty list"));
+            .toList();
     }
 
     /**
@@ -203,44 +236,43 @@ public class BiddingService {
     }
 
     /**
-     * Compute dynamic bid price based on segment win/loss history.
-     * Strategy:
-     * - Cold start (< windowSize auctions): bid floorPrice * coldStartMultiplier
-     * - High win rate (>70%): shade down (winning too easily, save budget)
-     * - Low win rate (<30%): bid up (losing too much, need to be more competitive)
-     * - Healthy win rate (30-70%): bid base * marketMultiplier
-     * - 5% exploration: random ±10% offset to prevent convergence
+     * Compute bid price using stats-based shading for first-price auctions.
+     * In first-price, you pay exactly what you bid — so the optimal bid is the
+     * minimum needed to win. Uses in-memory cached segment stats (no Redis call on hot path).
      */
     private double computeBidPrice(BidRequest request, Creative creative) {
         double floorPrice = request.floorPrice();
         BidderProperties.Strategy strategy = properties.getStrategy();
 
-        // Compute bid price synchronously using cold-start strategy
-        // (segment stats lookup is too slow for 50ms Redis timeout)
-        double bid = floorPrice * strategy.getColdStartMultiplier();
-        log.debug("COLD-START floor={} bid={}", floorPrice, bid);
-        return enforceConstraints(bid, floorPrice, creative);
-    }
-
-    /**
-     * Compute bid price asynchronously with segment stats (unused - too slow for 50ms timeout).
-     * Kept for reference in case timeout constraints are relaxed in future.
-     */
-    @SuppressWarnings("unused")
-    private double computeBidPriceWithStats(BidRequest request, Creative creative) {
-        double floorPrice = request.floorPrice();
-        BidderProperties.Strategy strategy = properties.getStrategy();
-
-        // Build segment key from targeting
         String segmentKey = BidderStatsCache.buildSegmentKey(
             request.targeting().geo(),
             request.targeting().deviceType(),
             request.targeting().audienceSegment()
         );
 
-        // This would require making the entire bid() method async, which is too risky
-        // given the 50ms Redis timeout constraint
-        throw new UnsupportedOperationException("Stats-based bidding disabled due to 50ms Redis timeout");
+        BidderStatsCache.SegmentStats stats = statsCache.getSegmentStatsCached(segmentKey);
+
+        double multiplier;
+        if (stats.totalAuctions() < strategy.getMinSamples()) {
+            multiplier = strategy.getColdStartMultiplier();
+        } else if (stats.winRate() > 0.60) {
+            // Winning too easily — shade down aggressively to save budget
+            multiplier = strategy.getMarketMultiplier();
+        } else if (stats.winRate() < 0.30) {
+            // Losing too much — bid higher to be competitive
+            multiplier = strategy.getPacingBoost();
+        } else {
+            // Healthy win rate — bid just above floor
+            multiplier = strategy.getColdStartMultiplier();
+        }
+
+        // 5% exploration: small random offset to discover price sensitivity
+        if (random.nextDouble() < 0.05) {
+            multiplier += (random.nextDouble() - 0.5) * 0.04; // ±2% jitter
+        }
+
+        double bid = floorPrice * multiplier;
+        return enforceConstraints(bid, floorPrice, creative);
     }
 
     private double enforceConstraints(double bid, double floorPrice, Creative creative) {
@@ -267,13 +299,6 @@ public class BiddingService {
         return creativeCache.getAll()
                 .flatMap(c -> statsCache.getRemainingBudget(c.getId()).map(budget -> Map.entry(c.getId(), budget)))
                 .collectMap(Map.Entry::getKey, Map.Entry::getValue, LinkedHashMap::new);
-    }
-
-    private Flux<Creative> matchingCreatives(BidRequest request, Flux<Creative> all) {
-        return all.filter(c -> c.matches(
-                        request.targeting().geo(),
-                        request.targeting().deviceType(),
-                        request.targeting().audienceSegment()));
     }
 
     private CreativeDto toCreativeDto(Creative creative) {
