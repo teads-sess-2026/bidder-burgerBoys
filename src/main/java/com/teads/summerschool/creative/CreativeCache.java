@@ -69,8 +69,8 @@ public class CreativeCache {
      * Uses Redis SET + MGET for O(1) lookup instead of KEYS scan.
      */
     public Flux<Creative> getAll() {
-        // Fast path: return from in-memory cache if fresh
-        if (!inMemoryCache.isEmpty() && inMemoryCache.values().stream().noneMatch(CachedCreative::isExpired)) {
+        // Fast path: return from in-memory cache if it's populated (creatives are static during a run)
+        if (!inMemoryCache.isEmpty()) {
             return Flux.fromIterable(inMemoryCache.values()).map(c -> c.creative);
         }
 
