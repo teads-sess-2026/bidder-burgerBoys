@@ -60,7 +60,6 @@ public class AuctionNoticeConsumer {
             if (won) {
                 String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
 
-                // Record win in per-segment stats
                 if (!segmentKey.isEmpty()) {
                     statsCache.recordWinForSegment(
                         segmentKey,
@@ -69,10 +68,9 @@ public class AuctionNoticeConsumer {
                     ).block();
                 }
 
-                // Existing budget tracking
-                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice()).block();
+                // Refund overpayment: we reserved bidPrice, but only pay clearingPrice
+                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice(), ourBid.bidPrice()).block();
 
-                // Save win notice to DB
                 WinNotice winNotice = new WinNotice(
                     notice.getRequestId(),
                     properties.getId(),
@@ -81,7 +79,6 @@ public class AuctionNoticeConsumer {
                 );
                 winNoticeRepository.save(winNotice).block();
 
-                // Record metrics
                 metrics.recordWin(notice.getClearingPrice());
 
                 log.info("** WIN  id={} creative={} clearing={} segment={}",
@@ -89,12 +86,13 @@ public class AuctionNoticeConsumer {
             } else {
                 String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
 
-                // Record loss in per-segment stats
                 if (!segmentKey.isEmpty()) {
                     statsCache.recordLossForSegment(segmentKey, ourBid.bidPrice()).block();
                 }
 
-                // Record metrics
+                // Refund entire reservation — we didn't win, so we owe nothing
+                statsCache.recordLoss(ourBid.creativeId(), ourBid.bidPrice()).block();
+
                 metrics.recordLoss();
 
                 log.debug("LOSS id={} bid={} segment={}",

@@ -59,15 +59,23 @@ public class BidderStatsCache {
 
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
-    // KEYS[1] = budget key, ARGV[1] = default budget (used only if the key doesn't exist yet),
-    // ARGV[2] = clearing price to subtract. Atomic on the Redis server itself, replacing the old
-    // synchronized setIfAbsent()-then-increment() pair, which only ever guarded against
-    // concurrent callers within this one JVM, not against Redis itself.
-    private static final RedisScript<Double> RECORD_WIN_SCRIPT = RedisScript.of("""
+    // KEYS[1] = budget key, ARGV[1] = default budget (lazy init), ARGV[2] = amount to reserve.
+    // Returns new remaining if reservation succeeded (>= 0), or -1 if insufficient budget.
+    private static final RedisScript<Double> RESERVE_BUDGET_SCRIPT = RedisScript.of("""
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
-            return redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[2]))
+            local current = tonumber(redis.call('GET', KEYS[1]))
+            local amount = tonumber(ARGV[2])
+            if current < amount then
+                return -1
+            end
+            return redis.call('INCRBYFLOAT', KEYS[1], -amount)
+            """, Double.class);
+
+    // KEYS[1] = budget key, ARGV[1] = amount to refund. Simple add-back, no guard needed.
+    private static final RedisScript<Double> REFUND_BUDGET_SCRIPT = RedisScript.of("""
+            return redis.call('INCRBYFLOAT', KEYS[1], tonumber(ARGV[1]))
             """, Double.class);
 
     private static final RedisScript<Void> RECORD_SEGMENT_WIN_SCRIPT = RedisScript.of("""
@@ -157,14 +165,52 @@ public class BidderStatsCache {
                 .doOnNext(ok -> log.info("Creative budget initialized: {} = {}", key, budget));
     }
 
-    /** Decrement the winning creative's remaining budget by what it paid. */
-    public Mono<Double> recordWin(String creativeId, double clearingPrice) {
+    /**
+     * Atomically reserve bidPrice from a creative's budget before placing a bid.
+     * Returns the new remaining budget if reservation succeeded, or empty Mono if insufficient funds.
+     */
+    public Mono<Double> reserveBudget(String creativeId, double bidPrice) {
         String key = budgetKey(creativeId);
-        return redis.execute(RECORD_WIN_SCRIPT,
+        return redis.execute(RESERVE_BUDGET_SCRIPT,
                         List.of(key),
-                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(clearingPrice)))
+                        List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(bidPrice)))
                 .next()
-                .doOnNext(after -> log.info("BUDGET  key={} clearing={} remaining={}", key, clearingPrice, after))
+                .flatMap(result -> {
+                    if (result < 0) {
+                        budgetCache.put(creativeId, new CachedBudget(0.0));
+                        return Mono.empty();
+                    }
+                    budgetCache.put(creativeId, new CachedBudget(result));
+                    log.debug("RESERVE key={} amount={} remaining={}", key, bidPrice, result);
+                    return Mono.just(result);
+                });
+    }
+
+    /**
+     * Refund a previously reserved amount back to the creative's budget (on loss or overpayment).
+     */
+    public Mono<Double> refundBudget(String creativeId, double amount) {
+        if (amount <= 0) return Mono.just(0.0);
+        String key = budgetKey(creativeId);
+        return redis.execute(REFUND_BUDGET_SCRIPT,
+                        List.of(key),
+                        List.of(String.valueOf(amount)))
+                .next()
+                .doOnNext(after -> {
+                    budgetCache.put(creativeId, new CachedBudget(after));
+                    log.debug("REFUND  key={} amount={} remaining={}", key, amount, after);
+                });
+    }
+
+    /**
+     * On win: refund the difference between reserved bidPrice and actual clearingPrice,
+     * then sync to Postgres.
+     */
+    public Mono<Double> recordWin(String creativeId, double clearingPrice, double bidPrice) {
+        double refundAmount = bidPrice - clearingPrice;
+        return refundBudget(creativeId, refundAmount)
+                .doOnNext(after -> log.info("BUDGET  key={} clearing={} refund={} remaining={}",
+                        budgetKey(creativeId), clearingPrice, refundAmount, after))
                 .flatMap(after -> creativeRepository.findById(creativeId)
                         .flatMap(c -> {
                             c.setBudget(after);
@@ -172,9 +218,6 @@ public class BidderStatsCache {
                         })
                         .thenReturn(after))
                 .doOnNext(after -> {
-                    // Update in-memory budget cache
-                    budgetCache.put(creativeId, new CachedBudget(after));
-
                     winCount.incrementAndGet();
                     synchronized (recentWinPrices) {
                         recentWinPrices.addLast(clearingPrice);
@@ -183,6 +226,21 @@ public class BidderStatsCache {
                         }
                     }
                 });
+    }
+
+    /**
+     * On loss: refund the entire reserved bidPrice back to the creative's budget.
+     */
+    public Mono<Double> recordLoss(String creativeId, double bidPrice) {
+        return refundBudget(creativeId, bidPrice)
+                .doOnNext(after -> log.info("LOSS-REFUND key={} refund={} remaining={}",
+                        budgetKey(creativeId), bidPrice, after))
+                .flatMap(after -> creativeRepository.findById(creativeId)
+                        .flatMap(c -> {
+                            c.setBudget(after);
+                            return creativeRepository.save(c);
+                        })
+                        .thenReturn(after));
     }
 
     /** Remaining budget for a creative. Lazily initializes to the flat creative budget if missing. */

@@ -20,10 +20,14 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
@@ -153,8 +157,8 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(c1, c2));
-        when(statsCache.getRemainingBudget("c1")).thenReturn(Mono.just(0.0));
-        when(statsCache.getRemainingBudget("c2")).thenReturn(Mono.just(0.0));
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("c1", 0.0, "c2", 0.0)));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -168,10 +172,6 @@ class BiddingServiceTest {
 
         assertThat(saved.getNoBidReason()).isEqualTo("budget_exhausted");
         verify(metrics).recordNoBid("budget_exhausted");
-
-        // Verify budget was checked for both (they both passed Layer 1 and 2)
-        verify(statsCache).getRemainingBudget("c1");
-        verify(statsCache).getRemainingBudget("c2");
     }
 
     @Test
@@ -189,10 +189,9 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(universal, geoTargeted, fullyTargeted));
-        when(statsCache.getRemainingBudget(anyString())).thenReturn(Mono.just(10.0));
-        when(statsCache.getSegmentStats(anyString())).thenReturn(
-            Mono.just(new BidderStatsCache.SegmentStats(100, 50, 3.0, 0.5, 2.5))
-        );
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("universal", 10.0, "geo", 10.0, "full", 10.0)));
+        when(statsCache.reserveBudget(eq("full"), anyDouble())).thenReturn(Mono.just(8.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -227,10 +226,9 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(low, high));
-        when(statsCache.getRemainingBudget(anyString())).thenReturn(Mono.just(10.0));
-        when(statsCache.getSegmentStats(anyString())).thenReturn(
-            Mono.just(new BidderStatsCache.SegmentStats(100, 50, 3.0, 0.5, 2.5))
-        );
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("low", 10.0, "high", 10.0)));
+        when(statsCache.reserveBudget(eq("high"), anyDouble())).thenReturn(Mono.just(8.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -260,10 +258,9 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(nullMax, withMax));
-        when(statsCache.getRemainingBudget(anyString())).thenReturn(Mono.just(10.0));
-        when(statsCache.getSegmentStats(anyString())).thenReturn(
-            Mono.just(new BidderStatsCache.SegmentStats(100, 50, 3.0, 0.5, 2.5))
-        );
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("null", 10.0, "with", 10.0)));
+        when(statsCache.reserveBudget(eq("with"), anyDouble())).thenReturn(Mono.just(8.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -286,10 +283,9 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(creative));
-        when(statsCache.getRemainingBudget("winner")).thenReturn(Mono.just(25.0));
-        when(statsCache.getSegmentStats(anyString())).thenReturn(
-            Mono.just(new BidderStatsCache.SegmentStats(100, 50, 3.0, 0.5, 2.5))
-        );
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("winner", 25.0)));
+        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(22.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -337,10 +333,9 @@ class BiddingServiceTest {
         );
 
         when(creativeCache.getAll()).thenReturn(Flux.just(failLayer1a, failLayer1b, failLayer2, winner));
-        when(statsCache.getRemainingBudget("winner")).thenReturn(Mono.just(10.0));
-        when(statsCache.getSegmentStats(anyString())).thenReturn(
-            Mono.just(new BidderStatsCache.SegmentStats(100, 50, 3.0, 0.5, 2.5))
-        );
+        when(statsCache.getRemainingBudgets(anyList()))
+            .thenReturn(Mono.just(Map.of("winner", 10.0)));
+        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(8.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -348,12 +343,11 @@ class BiddingServiceTest {
         // ASSERT
         assertThat(response).isPresent();
 
-        // CRITICAL: Budget should ONLY be checked for "winner"
-        // (fail1a and fail1b failed Layer 1, fail2 failed Layer 2)
-        verify(statsCache, times(1)).getRemainingBudget("winner");
-        verify(statsCache, never()).getRemainingBudget("fail1a");
-        verify(statsCache, never()).getRemainingBudget("fail1b");
-        verify(statsCache, never()).getRemainingBudget("fail2");
+        // Budget reservation should only happen for "winner" (the selected creative)
+        verify(statsCache).reserveBudget(eq("winner"), anyDouble());
+        verify(statsCache, never()).reserveBudget(eq("fail1a"), anyDouble());
+        verify(statsCache, never()).reserveBudget(eq("fail1b"), anyDouble());
+        verify(statsCache, never()).reserveBudget(eq("fail2"), anyDouble());
     }
 
     // Helper method to create test creatives

@@ -119,7 +119,7 @@ public class BiddingService {
                     return finishNoBid(record, "targeting_miss", startTime);
                 }
 
-                // LAYER 3: Budget filter (Redis - batch check all at once)
+                // LAYER 3: Budget pre-filter (in-memory cache - fast reject of known-exhausted)
                 List<String> creativeIds = layer2.stream().map(Creative::getId).toList();
                 return statsCache.getRemainingBudgets(creativeIds)
                     .map(budgetMap -> layer2.stream()
@@ -133,25 +133,30 @@ public class BiddingService {
                         // LAYER 4: Select best creative by specificity + maxBidPrice tiebreak
                         Creative selected = selectBestCreative(layer3);
 
-                        // LAYER 5: Compute bid price and return response
+                        // LAYER 5: Compute bid price
                         double bidPrice = computeBidPrice(request, selected);
 
-                        record.setBidPrice(bidPrice);
-                        record.setCreativeId(selected.getId());
-                        record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
+                        // LAYER 6: Atomic budget reservation in Redis - guarantees no overspend
+                        return statsCache.reserveBudget(selected.getId(), bidPrice)
+                            .flatMap(remaining -> {
+                                record.setBidPrice(bidPrice);
+                                record.setCreativeId(selected.getId());
+                                record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
 
-                        // Record in OwnBidCache for Kafka consumer
-                        ownBidCache.record(request.requestId(), selected.getId(), bidPrice);
+                                ownBidCache.record(request.requestId(), selected.getId(), bidPrice);
 
-                        metrics.recordBid();
-                        metrics.recordLatency(record.getLatencyMs());
+                                metrics.recordBid();
+                                metrics.recordLatency(record.getLatencyMs());
 
-                        return bidRecordRepository.save(record)
-                            .thenReturn(Optional.of(new BidResponse(
-                                request.requestId(),
-                                bidPrice,
-                                toCreativeDto(selected)
-                            )));
+                                return bidRecordRepository.save(record)
+                                    .thenReturn(Optional.of(new BidResponse(
+                                        request.requestId(),
+                                        bidPrice,
+                                        toCreativeDto(selected)
+                                    )));
+                            })
+                            .switchIfEmpty(Mono.defer(() ->
+                                finishNoBid(record, "budget_exhausted", startTime)));
                     });
             });
     }
