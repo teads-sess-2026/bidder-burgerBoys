@@ -60,23 +60,25 @@ public class BidderStatsCache {
     private static final Logger log = LoggerFactory.getLogger(BidderStatsCache.class);
 
     // KEYS[1] = budget key, ARGV[1] = default budget (lazy init), ARGV[2] = amount to reserve.
-    // Returns new remaining if reservation succeeded (>= 0), or -1 if insufficient budget.
-    private static final RedisScript<Double> RESERVE_BUDGET_SCRIPT = RedisScript.of("""
+    // Returns new remaining as a bulk string if reservation succeeded, or "-1" if insufficient.
+    // Uses INCRBYFLOAT(key, 0) for the reject path so the return type is always a bulk string
+    // (Lua integer -1 can't deserialize as Double via Spring Data Redis).
+    private static final RedisScript<String> RESERVE_BUDGET_SCRIPT = RedisScript.of("""
             if redis.call('EXISTS', KEYS[1]) == 0 then
                 redis.call('SET', KEYS[1], ARGV[1])
             end
             local current = tonumber(redis.call('GET', KEYS[1]))
             local amount = tonumber(ARGV[2])
             if current < amount then
-                return -1
+                return '-1'
             end
             return redis.call('INCRBYFLOAT', KEYS[1], -amount)
-            """, Double.class);
+            """, String.class);
 
     // KEYS[1] = budget key, ARGV[1] = amount to refund. Simple add-back, no guard needed.
-    private static final RedisScript<Double> REFUND_BUDGET_SCRIPT = RedisScript.of("""
+    private static final RedisScript<String> REFUND_BUDGET_SCRIPT = RedisScript.of("""
             return redis.call('INCRBYFLOAT', KEYS[1], tonumber(ARGV[1]))
-            """, Double.class);
+            """, String.class);
 
     private static final RedisScript<Void> RECORD_SEGMENT_WIN_SCRIPT = RedisScript.of("""
             redis.call('HINCRBY', KEYS[1], 'totalAuctions', 1)
@@ -175,10 +177,11 @@ public class BidderStatsCache {
                         List.of(key),
                         List.of(String.valueOf(properties.getCreativeBudget()), String.valueOf(bidPrice)))
                 .next()
-                .flatMap(result -> {
+                .flatMap(raw -> {
+                    double result = Double.parseDouble(raw);
                     if (result < 0) {
                         budgetCache.put(creativeId, new CachedBudget(0.0));
-                        return Mono.empty();
+                        return Mono.<Double>empty();
                     }
                     budgetCache.put(creativeId, new CachedBudget(result));
                     log.debug("RESERVE key={} amount={} remaining={}", key, bidPrice, result);
@@ -196,6 +199,7 @@ public class BidderStatsCache {
                         List.of(key),
                         List.of(String.valueOf(amount)))
                 .next()
+                .map(Double::parseDouble)
                 .doOnNext(after -> {
                     budgetCache.put(creativeId, new CachedBudget(after));
                     log.debug("REFUND  key={} amount={} remaining={}", key, amount, after);

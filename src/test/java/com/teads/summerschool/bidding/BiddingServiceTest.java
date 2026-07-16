@@ -75,6 +75,10 @@ class BiddingServiceTest {
         lenient().when(properties.getTimeoutMs()).thenReturn(300L);
         lenient().when(properties.getId()).thenReturn("test-bidder");
 
+        // Segment stats cached — return cold-start (empty) stats by default
+        lenient().when(statsCache.getSegmentStatsCached(anyString()))
+            .thenReturn(BidderStatsCache.SegmentStats.empty());
+
         // Mock bid record repository to return saved record
         when(bidRecordRepository.save(any(BidRecord.class)))
             .thenAnswer(invocation -> Mono.just(invocation.getArgument(0)));
@@ -190,8 +194,8 @@ class BiddingServiceTest {
 
         when(creativeCache.getAll()).thenReturn(Flux.just(universal, geoTargeted, fullyTargeted));
         when(statsCache.getRemainingBudgets(anyList()))
-            .thenReturn(Mono.just(Map.of("universal", 10.0, "geo", 10.0, "full", 10.0)));
-        when(statsCache.reserveBudget(eq("full"), anyDouble())).thenReturn(Mono.just(8.0));
+            .thenReturn(Mono.just(Map.of("universal", 100.0, "geo", 100.0, "full", 100.0)));
+        when(statsCache.reserveBudget(anyString(), anyDouble())).thenReturn(Mono.just(98.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -227,8 +231,8 @@ class BiddingServiceTest {
 
         when(creativeCache.getAll()).thenReturn(Flux.just(low, high));
         when(statsCache.getRemainingBudgets(anyList()))
-            .thenReturn(Mono.just(Map.of("low", 10.0, "high", 10.0)));
-        when(statsCache.reserveBudget(eq("high"), anyDouble())).thenReturn(Mono.just(8.0));
+            .thenReturn(Mono.just(Map.of("low", 100.0, "high", 100.0)));
+        when(statsCache.reserveBudget(anyString(), anyDouble())).thenReturn(Mono.just(98.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -259,8 +263,8 @@ class BiddingServiceTest {
 
         when(creativeCache.getAll()).thenReturn(Flux.just(nullMax, withMax));
         when(statsCache.getRemainingBudgets(anyList()))
-            .thenReturn(Mono.just(Map.of("null", 10.0, "with", 10.0)));
-        when(statsCache.reserveBudget(eq("with"), anyDouble())).thenReturn(Mono.just(8.0));
+            .thenReturn(Mono.just(Map.of("null", 100.0, "with", 100.0)));
+        when(statsCache.reserveBudget(anyString(), anyDouble())).thenReturn(Mono.just(98.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -284,8 +288,8 @@ class BiddingServiceTest {
 
         when(creativeCache.getAll()).thenReturn(Flux.just(creative));
         when(statsCache.getRemainingBudgets(anyList()))
-            .thenReturn(Mono.just(Map.of("winner", 25.0)));
-        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(22.0));
+            .thenReturn(Mono.just(Map.of("winner", 200.0)));
+        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(197.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
@@ -334,8 +338,8 @@ class BiddingServiceTest {
 
         when(creativeCache.getAll()).thenReturn(Flux.just(failLayer1a, failLayer1b, failLayer2, winner));
         when(statsCache.getRemainingBudgets(anyList()))
-            .thenReturn(Mono.just(Map.of("winner", 10.0)));
-        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(8.0));
+            .thenReturn(Mono.just(Map.of("winner", 100.0)));
+        when(statsCache.reserveBudget(eq("winner"), anyDouble())).thenReturn(Mono.just(98.0));
 
         // ACT
         Optional<BidResponse> response = service.bid(request).block();
