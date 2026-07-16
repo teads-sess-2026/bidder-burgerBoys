@@ -20,10 +20,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * Per-creative budget cache backed by Redis.
  *
  * <p>Key format: {@code {bidderId}_{creativeId}_budget}, value = remaining budget.
- * Each creative has its own budget limit; remaining decreases on each Kafka-confirmed
- * win for that creative. Both this bidder and the SSP read these keys to decide whether
- * a creative can still spend. Postgres's {@code creatives.budget} column is kept in sync
- * with the same remaining value so it isn't lost if Redis is wiped.
+ * The SSP is the single owner of these keys and atomically decrements them on each win.
+ * This bidder never writes spend to them: it only seeds them once with SETNX/setIfAbsent
+ * (so a restart can't refill an already-spent budget) and reads them. The in-memory
+ * budget tracking below is the bidder's own local view used for bid decisions.
  */
 @Component
 public class BidderStatsCache {
@@ -131,7 +131,10 @@ public class BidderStatsCache {
         }
     }
 
-    /** Set a creative's remaining budget to its full limit. Called once per creative on startup. */
+    /**
+     * Seed a creative's budget key in Redis with its full limit. Called once per creative on startup.
+     * Uses setIfAbsent (SETNX) so a bidder restart never refills a budget the SSP has already spent.
+     */
     public Mono<Boolean> initBudget(String creativeId, double budget) {
         budgets.put(creativeId, new double[]{budget});
         synchronized (totalBudgetLock) {
@@ -140,20 +143,26 @@ public class BidderStatsCache {
         }
         log.info("Creative budget initialized in-memory: {} = {}", creativeId, budget);
         String key = budgetKey(creativeId);
-        return redis.opsForValue().set(key, String.valueOf(budget))
+        return redis.opsForValue().setIfAbsent(key, String.valueOf(budget))
                 .timeout(java.time.Duration.ofSeconds(2))
-                .doOnNext(ok -> log.debug("Budget synced to Redis: {} = {}", key, budget))
+                .doOnNext(seeded -> {
+                    if (seeded) {
+                        log.info("Budget key seeded in Redis: {} = {}", key, budget);
+                    } else {
+                        log.info("Budget key already exists in Redis, left untouched (SSP-owned): {}", key);
+                    }
+                })
                 .onErrorResume(e -> {
-                    log.warn("Failed to sync initial budget to Redis for {} — SSP will see it on next reserve: {}",
+                    log.warn("Failed to seed budget key in Redis for {} — will lazy-seed on next reserve/refund: {}",
                             creativeId, e.getMessage());
                     return Mono.just(true);
                 });
     }
 
     /**
-     * Atomically reserve bidPrice from a creative's budget before placing a bid.
+     * Atomically reserve bidPrice from a creative's local budget before placing a bid.
      * Returns the new remaining budget if reservation succeeded, or empty Mono if insufficient funds.
-     * Decision is in-memory (instant); Redis is updated async for SSP visibility.
+     * Decision is in-memory (instant); the Redis budget key is never written here — the SSP owns it.
      */
     public Mono<Double> reserveBudget(String creativeId, double bidPrice) {
         double[] holder = budgets.computeIfAbsent(creativeId,
@@ -171,13 +180,13 @@ public class BidderStatsCache {
             cachedTotalRemaining -= bidPrice;
         }
         log.debug("RESERVE creative={} amount={} remaining={}", creativeId, bidPrice, remaining);
-        syncBudgetToRedis(creativeId, remaining);
+        seedBudgetKeyIfMissing(creativeId);
         return Mono.just(remaining);
     }
 
     /**
-     * Refund a previously reserved amount back to the creative's budget (on loss or overpayment).
-     * In-memory is source of truth; Redis synced async for SSP visibility.
+     * Refund a previously reserved amount back to the creative's local budget (on loss or overpayment).
+     * In-memory only — the Redis budget key is owned and decremented by the SSP.
      */
     public Mono<Double> refundBudget(String creativeId, double amount) {
         if (amount <= 0) return Mono.just(0.0);
@@ -193,20 +202,30 @@ public class BidderStatsCache {
             cachedTotalRemaining += amount;
         }
         log.debug("REFUND  creative={} amount={} remaining={}", creativeId, amount, remaining);
-        syncBudgetToRedis(creativeId, remaining);
+        seedBudgetKeyIfMissing(creativeId);
         return Mono.just(remaining);
     }
 
-    /** Fire-and-forget sync of current budget to Redis so the SSP can read it. */
-    private void syncBudgetToRedis(String creativeId, double remaining) {
-        redis.opsForValue().set(budgetKey(creativeId), String.valueOf(remaining))
-                .subscribe(null, err -> log.warn("Failed to sync budget to Redis for {}: {}",
+    /**
+     * Fire-and-forget lazy seed of the budget key in Redis via setIfAbsent (SETNX), in case
+     * startup seeding failed. Never overwrites an existing value — the SSP owns the key.
+     */
+    private void seedBudgetKeyIfMissing(String creativeId) {
+        String key = budgetKey(creativeId);
+        double budget = properties.getCreativeBudget();
+        redis.opsForValue().setIfAbsent(key, String.valueOf(budget))
+                .subscribe(seeded -> {
+                    if (Boolean.TRUE.equals(seeded)) {
+                        log.info("Budget key lazily seeded in Redis: {} = {}", key, budget);
+                    }
+                }, err -> log.warn("Failed to lazy-seed budget key in Redis for {}: {}",
                         creativeId, err.getMessage()));
     }
 
     /**
-     * On win: refund the difference between reserved bidPrice and actual clearingPrice.
-     * Updates in-memory budget immediately and syncs to Postgres asynchronously.
+     * On win: refund the difference between reserved bidPrice and actual clearingPrice
+     * in the local in-memory budget, and update local win statistics. The Redis budget
+     * key is not touched — the SSP decrements it atomically on each win.
      */
     public Mono<Double> recordWin(String creativeId, double clearingPrice, double bidPrice) {
         double refundAmount = bidPrice - clearingPrice;
@@ -222,42 +241,44 @@ public class BidderStatsCache {
                         }
                     }
                     // Async Postgres sync — fire-and-forget so it doesn't block the hot path
-                    final double remaining = after;
-                    creativeRepository.findById(creativeId)
-                            .flatMap(c -> {
-                                c.setBudget(remaining);
-                                return creativeRepository.save(c);
-                            })
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .subscribe(
-                                    ok -> {},
-                                    err -> log.warn("Failed to sync budget to Postgres for {}: {}",
-                                            creativeId, err.getMessage())
-                            );
+                    // final double remaining = after;
+                    // creativeRepository.findById(creativeId)
+                    //         .flatMap(c -> {
+                    //             c.setBudget(remaining);
+                    //             return creativeRepository.save(c);
+                    //         })
+                    //         .subscribeOn(Schedulers.boundedElastic())
+                    //         .subscribe(
+                    //                 ok -> {},
+                    //                 err -> log.warn("Failed to sync budget to Postgres for {}: {}",
+                    //                         creativeId, err.getMessage())
+                    //         );
                 });
     }
 
     /**
-     * On loss: refund the entire reserved bidPrice back to the creative's budget.
-     * Updates in-memory immediately and syncs to Postgres asynchronously.
+     * On loss: refund the entire reserved bidPrice back to the creative's local budget.
+     * In-memory only — the Redis budget key stays untouched.
      */
     public Mono<Double> recordLoss(String creativeId, double bidPrice) {
         return refundBudget(creativeId, bidPrice)
                 .doOnNext(after -> {
                     log.info("LOSS-REFUND creative={} refund={} remaining={}", creativeId, bidPrice, after);
-                    // Async Postgres sync
-                    final double remaining = after;
-                    creativeRepository.findById(creativeId)
-                            .flatMap(c -> {
-                                c.setBudget(remaining);
-                                return creativeRepository.save(c);
-                            })
-                            .subscribeOn(Schedulers.boundedElastic())
-                            .subscribe(
-                                    ok -> {},
-                                    err -> log.warn("Failed to sync budget to Postgres for {}: {}",
-                                            creativeId, err.getMessage())
-                            );
+                    // PG write-back intentionally removed (same as recordWin above):
+                    // creatives.budget keeps the initial seed value; Redis alone
+                    // tracks remaining budget.
+                    // final double remaining = after;
+                    // creativeRepository.findById(creativeId)
+                    //         .flatMap(c -> {
+                    //             c.setBudget(remaining);
+                    //             return creativeRepository.save(c);
+                    //         })
+                    //         .subscribeOn(Schedulers.boundedElastic())
+                    //         .subscribe(
+                    //                 ok -> {},
+                    //                 err -> log.warn("Failed to sync budget to Postgres for {}: {}",
+                    //                         creativeId, err.getMessage())
+                    //         );
                 });
     }
 

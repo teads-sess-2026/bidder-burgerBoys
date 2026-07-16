@@ -62,8 +62,6 @@ public class AuctionNoticeConsumer {
                     ).subscribe();
                 }
 
-                // Refund overpayment in-memory, then async Postgres sync
-                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice(), ourBid.bidPrice()).subscribe();
 
                 // Async save win notice to Postgres
                 WinNotice winNotice = new WinNotice(
@@ -84,7 +82,7 @@ public class AuctionNoticeConsumer {
                     statsCache.recordLossForSegment(segmentKey, ourBid.bidPrice()).subscribe();
                 }
 
-                // Refund entire reservation in-memory, then async Postgres sync
+                // Refund entire reservation in the local in-memory budget only
                 statsCache.recordLoss(ourBid.creativeId(), ourBid.bidPrice()).subscribe();
 
                 metrics.recordLoss();
