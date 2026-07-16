@@ -18,6 +18,7 @@ import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -42,6 +43,7 @@ public class BiddingService {
     // Last successfully computed budget.remaining, served when a scrape's
     // computation times out instead of blocking the scrape thread forever.
     private volatile double lastKnownBudget = 0.0;
+
 
     public BiddingService(BidderProperties properties,
                           CreativeCache creativeCache,
@@ -172,17 +174,22 @@ public class BiddingService {
                     record.setCreativeId(candidate.getId());
                     record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
 
-                    ownBidCache.record(request.requestId(), candidate.getId(), candidateBid);
+                    ownBidCache.record(request.requestId(), candidate.getId(), candidateBid,
+                        request.targeting() != null ? request.targeting().geo() : null,
+                        request.targeting() != null ? request.targeting().deviceType() : null,
+                        request.targeting() != null ? request.targeting().audienceSegment() : null);
 
                     metrics.recordBid();
                     metrics.recordLatency(record.getLatencyMs());
 
-                    return bidRecordRepository.save(record)
-                        .thenReturn(Optional.of(new BidResponse(
+                    // Fire-and-forget: don't block the bid response on Postgres write
+                    bidRecordRepository.save(record).subscribe();
+
+                    return Mono.just(Optional.of(new BidResponse(
                             request.requestId(),
                             candidateBid,
                             toCreativeDto(candidate)
-                        )));
+                    )));
                 })
                 .switchIfEmpty(Mono.defer(() -> fallback));
         }
@@ -191,14 +198,15 @@ public class BiddingService {
     }
 
     /**
-     * Finish with no-bid: set reason, record metrics, save to DB.
+     * Finish with no-bid: set reason, record metrics, save to DB (fire-and-forget).
      */
     private Mono<Optional<BidResponse>> finishNoBid(BidRecord record, String reason, long startTime) {
         record.setNoBidReason(reason);
         record.setLatencyMs((int) ((System.nanoTime() - startTime) / 1_000_000));
         metrics.recordNoBid(reason);
         metrics.recordLatency(record.getLatencyMs());
-        return bidRecordRepository.save(record).thenReturn(Optional.empty());
+        bidRecordRepository.save(record).subscribe();
+        return Mono.just(Optional.empty());
     }
 
     /**
@@ -236,9 +244,57 @@ public class BiddingService {
     }
 
     /**
+     * Returns a pacing multiplier based on how much time vs budget has been consumed.
+     * > 1.0 means we're behind pace (spend more aggressively),
+     * < 1.0 means we're ahead of pace (be more selective / bid lower).
+     * Returns 1.0 if pacing is disabled (no startTime configured).
+     */
+    private double getPacingMultiplier() {
+        BidderProperties.Competition comp = properties.getCompetition();
+        if (comp == null || comp.getStartTime() == null || comp.getStartTime().isBlank()) {
+            return 1.0;
+        }
+
+        Instant start;
+        try {
+            start = Instant.parse(comp.getStartTime());
+        } catch (Exception e) {
+            return 1.0;
+        }
+
+        long durationMs = comp.getDurationSeconds() * 1000;
+        long elapsed = System.currentTimeMillis() - start.toEpochMilli();
+
+        if (elapsed <= 0) return 1.0; // competition hasn't started
+        if (elapsed >= durationMs) return 1.0; // competition is over, spend freely
+
+        double timeFraction = (double) elapsed / durationMs;
+        double initialBudget = statsCache.getInitialTotalBudget();
+        if (initialBudget <= 0) return 1.0;
+        double remaining = statsCache.getTotalRemainingBudget();
+        double spent = initialBudget - remaining;
+        double budgetFraction = spent / initialBudget;
+
+        // ratio > 1 means spending faster than time is passing (ahead of pace)
+        // ratio < 1 means spending slower than time (behind pace)
+        double ratio = budgetFraction / timeFraction;
+
+        BidderProperties.Strategy strategy = properties.getStrategy();
+        if (ratio > 1.2) {
+            // Significantly ahead of pace — cut bids to be more selective
+            return strategy.getPacingCut();
+        } else if (ratio < 0.8) {
+            // Behind pace — boost bids to spend budget before time runs out
+            return strategy.getPacingBoost();
+        }
+        return 1.0;
+    }
+
+    /**
      * Compute bid price using stats-based shading for first-price auctions.
      * In first-price, you pay exactly what you bid — so the optimal bid is the
-     * minimum needed to win. Uses in-memory cached segment stats (no Redis call on hot path).
+     * minimum needed to win. Uses observed clearing/loss prices to anchor bids to
+     * actual market levels instead of blindly scaling the floor.
      */
     private double computeBidPrice(BidRequest request, Creative creative) {
         double floorPrice = request.floorPrice();
@@ -252,26 +308,37 @@ public class BiddingService {
 
         BidderStatsCache.SegmentStats stats = statsCache.getSegmentStatsCached(segmentKey);
 
-        double multiplier;
+        double bid;
         if (stats.totalAuctions() < strategy.getMinSamples()) {
-            multiplier = strategy.getColdStartMultiplier();
+            // Cold start: no market data yet, bid moderately above floor
+            bid = floorPrice * strategy.getColdStartMultiplier();
         } else if (stats.winRate() > 0.60) {
-            // Winning too easily — shade down aggressively to save budget
-            multiplier = strategy.getMarketMultiplier();
+            // Winning too easily — shade down toward observed clearing prices to save budget
+            double target = stats.avgClearingPrice() > 0
+                ? stats.avgClearingPrice() * strategy.getMarketMultiplier()
+                : floorPrice * strategy.getMarketMultiplier();
+            bid = Math.max(target, floorPrice + 0.01);
         } else if (stats.winRate() < 0.30) {
-            // Losing too much — bid higher to be competitive
-            multiplier = strategy.getPacingBoost();
+            // Losing too much — bid based on observed loss prices to reach winning range
+            double lossReference = stats.avgLossPrice() > 0 ? stats.avgLossPrice() : floorPrice;
+            bid = lossReference * strategy.getPacingBoost();
         } else {
-            // Healthy win rate — bid just above floor
-            multiplier = strategy.getColdStartMultiplier();
+            // Healthy win rate (30-60%) — bid just above observed clearing to stay competitive
+            double target = stats.avgClearingPrice() > 0
+                ? stats.avgClearingPrice() * 1.01
+                : floorPrice * strategy.getColdStartMultiplier();
+            bid = Math.max(target, floorPrice + 0.01);
         }
+
+        // Apply pacing: shade bids down if ahead of budget pace, up if behind
+        bid *= getPacingMultiplier();
 
         // 5% exploration: small random offset to discover price sensitivity
         if (random.nextDouble() < 0.05) {
-            multiplier += (random.nextDouble() - 0.5) * 0.04; // ±2% jitter
+            double jitter = (random.nextDouble() - 0.5) * 0.04 * bid;
+            bid += jitter;
         }
 
-        double bid = floorPrice * multiplier;
         return enforceConstraints(bid, floorPrice, creative);
     }
 

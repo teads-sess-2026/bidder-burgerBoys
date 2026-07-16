@@ -24,13 +24,14 @@ public class OwnBidCache {
     // the notice for a given requestId arrives within one auction cycle of the bid.
     private static final int MAX_SIZE = 20_000;
 
-    public record Entry(String creativeId, double bidPrice) {}
+    public record Entry(String creativeId, double bidPrice, String geo, String deviceType, String audienceSegment) {}
 
     private final ConcurrentHashMap<String, Entry> bids = new ConcurrentHashMap<>();
     private final Queue<String> insertionOrder = new ConcurrentLinkedQueue<>();
 
-    public void record(String requestId, String creativeId, double bidPrice) {
-        bids.put(requestId, new Entry(creativeId, bidPrice));
+    public void record(String requestId, String creativeId, double bidPrice,
+                       String geo, String deviceType, String audienceSegment) {
+        bids.put(requestId, new Entry(creativeId, bidPrice, geo, deviceType, audienceSegment));
         insertionOrder.add(requestId);
         while (insertionOrder.size() > MAX_SIZE) {
             String oldest = insertionOrder.poll();
