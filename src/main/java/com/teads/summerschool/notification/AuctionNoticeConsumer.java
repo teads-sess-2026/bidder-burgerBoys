@@ -3,8 +3,6 @@ package com.teads.summerschool.notification;
 import com.teads.summerschool.config.BidderProperties;
 import com.teads.summerschool.metrics.BidderMetrics;
 import com.teads.summerschool.proto.AuctionNoticeProto;
-import com.teads.summerschool.record.BidRecord;
-import com.teads.summerschool.record.BidRecordRepository;
 import com.teads.summerschool.record.BidderStatsCache;
 import com.teads.summerschool.record.OwnBidCache;
 import org.slf4j.Logger;
@@ -22,20 +20,17 @@ public class AuctionNoticeConsumer {
     private final BidderStatsCache statsCache;
     private final BidderMetrics metrics;
     private final OwnBidCache ownBidCache;
-    private final BidRecordRepository bidRecordRepository;
 
     public AuctionNoticeConsumer(WinNoticeRepository winNoticeRepository,
                                  BidderProperties properties,
                                  BidderStatsCache statsCache,
                                  BidderMetrics metrics,
-                                 OwnBidCache ownBidCache,
-                                 BidRecordRepository bidRecordRepository) {
+                                 OwnBidCache ownBidCache) {
         this.winNoticeRepository = winNoticeRepository;
         this.properties = properties;
         this.statsCache = statsCache;
         this.metrics = metrics;
         this.ownBidCache = ownBidCache;
-        this.bidRecordRepository = bidRecordRepository;
     }
 
     @KafkaListener(topics = "${kafka.topic.auction-notifications}",
@@ -44,10 +39,6 @@ public class AuctionNoticeConsumer {
         try {
             AuctionNoticeProto.AuctionNotice notice = AuctionNoticeProto.AuctionNotice.parseFrom(message);
 
-            // This topic broadcasts EVERY auction's outcome to EVERY bidder, so most
-            // messages a bidder receives are ones it never bid on. Filter on the
-            // in-memory OwnBidCache (see BiddingService.bid()) BEFORE touching Redis or
-            // Postgres — an O(1) local lookup instead of a DB round trip on every message.
             OwnBidCache.Entry ourBid = ownBidCache.get(notice.getRequestId());
             if (ourBid == null) {
                 return;
@@ -55,43 +46,46 @@ public class AuctionNoticeConsumer {
 
             boolean won = properties.getId().equals(notice.getWinningBidderId());
 
+            // Build segment key from in-memory OwnBidCache — no Postgres lookup needed
+            String segmentKey = BidderStatsCache.buildSegmentKey(
+                    ourBid.geo(), ourBid.deviceType(), ourBid.audienceSegment());
+
             log.debug("KAFKA  id={} winner={} won={}", notice.getRequestId(), notice.getWinningBidderId(), won);
 
             if (won) {
-                String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
-
+                // Update in-memory segment stats first (instant, no I/O)
                 if (!segmentKey.isEmpty()) {
                     statsCache.recordWinForSegment(
                         segmentKey,
                         notice.getClearingPrice(),
                         ourBid.bidPrice()
-                    ).block();
+                    ).subscribe();
                 }
 
-                // Refund overpayment: we reserved bidPrice, but only pay clearingPrice
-                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice(), ourBid.bidPrice()).block();
+                // Refund overpayment in-memory, then async Postgres sync
+                statsCache.recordWin(ourBid.creativeId(), notice.getClearingPrice(), ourBid.bidPrice()).subscribe();
 
+                // Async save win notice to Postgres
                 WinNotice winNotice = new WinNotice(
                     notice.getRequestId(),
                     properties.getId(),
                     notice.getClearingPrice(),
                     ourBid.bidPrice()
                 );
-                winNoticeRepository.save(winNotice).block();
+                winNoticeRepository.save(winNotice).subscribe();
 
                 metrics.recordWin(notice.getClearingPrice());
 
                 log.info("** WIN  id={} creative={} clearing={} segment={}",
                         notice.getRequestId(), ourBid.creativeId(), notice.getClearingPrice(), segmentKey);
             } else {
-                String segmentKey = buildSegmentKeyForRequest(notice.getRequestId());
-
+                // Update in-memory segment stats first
                 if (!segmentKey.isEmpty()) {
-                    statsCache.recordLossForSegment(segmentKey, ourBid.bidPrice()).block();
+                    statsCache.recordLossForSegment(segmentKey, ourBid.bidPrice()).subscribe();
                 }
 
-                // Refund entire reservation — we didn't win, so we owe nothing
-                statsCache.recordLoss(ourBid.creativeId(), ourBid.bidPrice()).block();
+                // Refund entire reservation in-memory, then async Postgres sync
+                statsCache.recordLoss(ourBid.creativeId(), ourBid.bidPrice()).subscribe();
 
                 metrics.recordLoss();
 
@@ -101,22 +95,5 @@ public class AuctionNoticeConsumer {
         } catch (Exception e) {
             log.error("** KAFKA ERROR  failed to process auction notice: {}", e.getMessage());
         }
-    }
-
-    /**
-     * Query BidRecord and build segment key from targeting dimensions.
-     * Returns empty string if BidRecord not found or targeting is incomplete.
-     */
-    private String buildSegmentKeyForRequest(String requestId) {
-        BidRecord record = bidRecordRepository.findByRequestId(requestId).block();
-        if (record == null) {
-            log.warn("BidRecord not found for requestId={}", requestId);
-            return "";
-        }
-        return BidderStatsCache.buildSegmentKey(
-            record.getGeo(),
-            record.getDeviceType(),
-            record.getAudienceSegment()
-        );
     }
 }

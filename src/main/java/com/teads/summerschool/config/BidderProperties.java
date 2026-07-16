@@ -34,14 +34,14 @@ public class BidderProperties {
     public void setCompetition(Competition competition) { this.competition = competition; }
 
     public static class Strategy {
-        private int minSamples = 10;
-        private double coldStartMultiplier = 1.02;
+        private int minSamples = 5;
+        private double coldStartMultiplier = 1.05;
         private int windowSize = 50;
-        private double marketMultiplier = 1.01;
+        private double marketMultiplier = 1.02;
         private double premiumMultiplier = 1.05;
-        private double pacingBoost = 1.04;
+        private double pacingBoost = 1.10;
         private double pacingCut = 0.85;
-        private double maxBudgetFraction = 0.02;
+        private double maxBudgetFraction = 0.05;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }

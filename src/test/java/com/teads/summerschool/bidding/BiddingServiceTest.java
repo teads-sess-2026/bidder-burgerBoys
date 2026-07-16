@@ -213,7 +213,7 @@ class BiddingServiceTest {
         assertThat(saved.getNoBidReason()).isNull();
 
         verify(metrics).recordBid();
-        verify(ownBidCache).record(eq("req-4"), eq("full"), anyDouble());
+        verify(ownBidCache).record(eq("req-4"), eq("full"), anyDouble(), any(), any(), any());
     }
 
     @Test
@@ -315,7 +315,7 @@ class BiddingServiceTest {
 
         verify(metrics).recordBid();
         verify(metrics).recordLatency(saved.getLatencyMs());
-        verify(ownBidCache).record(eq("req-7"), eq("winner"), anyDouble());
+        verify(ownBidCache).record(eq("req-7"), eq("winner"), anyDouble(), any(), any(), any());
     }
 
     @Test
