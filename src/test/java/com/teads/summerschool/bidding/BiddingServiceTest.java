@@ -75,9 +75,14 @@ class BiddingServiceTest {
         lenient().when(properties.getTimeoutMs()).thenReturn(300L);
         lenient().when(properties.getId()).thenReturn("test-bidder");
 
+        lenient().when(properties.getCreativeBudget()).thenReturn(25.0);
+
         // Segment stats cached — return cold-start (empty) stats by default
         lenient().when(statsCache.getSegmentStatsCached(anyString()))
             .thenReturn(BidderStatsCache.SegmentStats.empty());
+
+        // Budget ranking: return full budget by default so ranking reflects specificity
+        lenient().when(statsCache.getCachedRemainingBudget(anyString())).thenReturn(25.0);
 
         // Mock bid record repository to return saved record
         when(bidRecordRepository.save(any(BidRecord.class)))

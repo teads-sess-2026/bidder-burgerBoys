@@ -127,35 +127,36 @@ public class BiddingService {
                 }
 
                 // LAYER 3: Budget pre-filter (in-memory cache - fast reject of known-exhausted)
+                // Use a negative threshold to tolerate in-flight reservations that may be
+                // refunded. Only reject creatives that are deeply negative (truly spent).
                 List<String> creativeIds = layer2.stream().map(Creative::getId).toList();
                 return statsCache.getRemainingBudgets(creativeIds)
                     .flatMap(budgetMap -> {
+                        double reservationBuffer = -request.floorPrice() * 5;
                         List<Creative> layer3 = layer2.stream()
-                            .filter(c -> budgetMap.getOrDefault(c.getId(), 0.0) > 0)
+                            .filter(c -> budgetMap.getOrDefault(c.getId(), 0.0) > reservationBuffer)
                             .toList();
 
                         if (layer3.isEmpty()) {
                             return finishNoBid(record, "budget_exhausted", startTime);
                         }
 
-                        // LAYER 4: Rank creatives by specificity + maxBidPrice, try in order (fallback)
+                        // LAYER 4: Rank creatives by specificity + budget health
                         List<Creative> ranked = rankCreatives(layer3);
 
-                        // LAYER 5: Compute bid price with stats-based shading
-                        double bidPrice = computeBidPrice(request, ranked.get(0));
-
-                        // LAYER 6: Try each creative in ranked order until one has budget
-                        return tryReserveInOrder(ranked, bidPrice, request, record, startTime);
+                        // LAYER 5: Try each creative in ranked order, computing bid price per candidate
+                        return tryReserveInOrder(ranked, request, record, startTime);
                     });
             });
     }
 
     /**
-     * Try to reserve budget from creatives in ranked order. If the top pick is exhausted,
-     * fall back to the next one instead of giving up.
+     * Try to reserve budget from creatives in ranked order. Computes bid price
+     * individually per candidate so each creative's constraints are respected.
+     * If the top pick is exhausted, fall back to the next one.
      */
     private Mono<Optional<BidResponse>> tryReserveInOrder(
-            List<Creative> ranked, double bidPrice, BidRequest request, BidRecord record, long startTime) {
+            List<Creative> ranked, BidRequest request, BidRecord record, long startTime) {
 
         Mono<Optional<BidResponse>> chain = Mono.defer(() ->
             finishNoBid(record, "budget_exhausted", startTime));
@@ -211,25 +212,36 @@ public class BiddingService {
     }
 
     /**
-     * Rank creatives from best to worst using:
-     * 1. Specificity score (higher = more targeted)
-     * 2. Tiebreak by maxBidPrice descending (null treated as 0)
+     * Rank creatives from best to worst using a composite score that balances
+     * specificity against budget health. A nearly-exhausted high-specificity creative
+     * yields to a healthier lower-specificity one, preventing drain-then-die behavior.
      */
     private List<Creative> rankCreatives(List<Creative> creatives) {
+        double defaultBudget = properties.getCreativeBudget();
         return creatives.stream()
             .sorted((c1, c2) -> {
-                int spec1 = computeSpecificity(c1);
-                int spec2 = computeSpecificity(c2);
-
-                if (spec1 != spec2) {
-                    return Integer.compare(spec2, spec1); // descending
-                }
-
-                double max1 = c1.getMaxBidPrice() != null ? c1.getMaxBidPrice() : 0.0;
-                double max2 = c2.getMaxBidPrice() != null ? c2.getMaxBidPrice() : 0.0;
-                return Double.compare(max2, max1); // descending
+                double score1 = computeRankScore(c1, defaultBudget);
+                double score2 = computeRankScore(c2, defaultBudget);
+                return Double.compare(score2, score1); // descending
             })
             .toList();
+    }
+
+    private double computeRankScore(Creative creative, double defaultBudget) {
+        int specificity = computeSpecificity(creative);
+        double remaining = statsCache.getCachedRemainingBudget(creative.getId());
+        double budgetHealth = Math.min(remaining / defaultBudget, 1.0);
+
+        // When budget is critically low (<20%), penalize heavily regardless of specificity.
+        // This forces traffic to shift to healthier creatives before atomic reserve fails.
+        if (budgetHealth < 0.2) {
+            return budgetHealth * 2.0;
+        }
+
+        // Specificity (0-3) weighted equally with budget health (0-3 range).
+        // A spec-2 creative at 50% health (score=2+1.5=3.5) loses to
+        // a spec-1 creative at 100% health (score=1+3.0=4.0) — load spreads.
+        return specificity + budgetHealth * 3.0;
     }
 
     /**

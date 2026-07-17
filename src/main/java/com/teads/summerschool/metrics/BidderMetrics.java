@@ -25,7 +25,11 @@ public class BidderMetrics {
     private final Counter spend;
     private final Timer bidLatency;
 
-    public final Counter summerschool_bids;
+    private final Counter noBidFloor;
+    private final Counter noBidTargeting;
+    private final Counter noBidBudget;
+    private final Counter noBidExpensive;
+    private final Counter noBidTimeout;
 
     private final String prefix;
 
@@ -48,8 +52,16 @@ public class BidderMetrics {
                 .description("Total clearing price paid").register(registry);
         this.bidLatency = Timer.builder(prefix + "bid.latency")
                 .description("Bid handling latency").register(registry);
-        this.summerschool_bids = Counter.builder(prefix + "summerschool_bids")
-                .description("Summerschool bids").register(registry);
+        this.noBidFloor = Counter.builder(prefix + "nobid.floor_exceeds_max_bid")
+                .description("No-bids: floor price exceeds creative max bid").register(registry);
+        this.noBidTargeting = Counter.builder(prefix + "nobid.targeting_miss")
+                .description("No-bids: no creative matches targeting").register(registry);
+        this.noBidBudget = Counter.builder(prefix + "nobid.budget_exhausted")
+                .description("No-bids: all matching creatives out of budget").register(registry);
+        this.noBidExpensive = Counter.builder(prefix + "nobid.too_expensive")
+                .description("No-bids: floor price too high relative to remaining budget").register(registry);
+        this.noBidTimeout = Counter.builder(prefix + "nobid.timeout")
+                .description("No-bids: bid processing timed out").register(registry);
     }
 
     public void recordRequest() { requests.increment(); }
@@ -58,6 +70,13 @@ public class BidderMetrics {
 
     public void recordNoBid(String reason) {
         registry.counter(prefix + "nobids", "reason", reason == null ? "unknown" : reason).increment();
+        switch (reason == null ? "" : reason) {
+            case "floor_exceeds_max_bid" -> noBidFloor.increment();
+            case "targeting_miss" -> noBidTargeting.increment();
+            case "budget_exhausted" -> noBidBudget.increment();
+            case "too_expensive" -> noBidExpensive.increment();
+            case "timeout" -> noBidTimeout.increment();
+        }
     }
 
     public void recordLatency(long ms) { bidLatency.record(ms, TimeUnit.MILLISECONDS); }

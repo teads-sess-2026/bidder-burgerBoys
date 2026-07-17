@@ -1,0 +1,71 @@
+<h1>Targeting</h1>
+
+@if (targeting.value(); as data) {
+    <section class="sess-targeting__section">
+        <h2>By geo</h2>
+        <table class="sess-table">
+            <thead>
+                <tr><th>Geo</th><th>Bids</th><th>Wins</th><th>Win rate</th><th>Avg bid price</th></tr>
+            </thead>
+            <tbody>
+                @for (bucket of data.by_geo; track bucket.key) {
+                    <tr>
+                        <td>{{ bucket.key }}</td>
+                        <td>{{ bucket.bids | number }}</td>
+                        <td>{{ bucket.wins | number }}</td>
+                        <td>{{ bucket.win_rate | percent:'1.1-2' }}</td>
+                        <td>{{ bucket.avg_bid_price | number:'1.2-4' }}</td>
+                    </tr>
+                } @empty {
+                    <tr><td colspan="5" class="sess-table__empty">No data yet.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
+
+    <section class="sess-targeting__section">
+        <h2>By device</h2>
+        <table class="sess-table">
+            <thead>
+                <tr><th>Device</th><th>Bids</th><th>Wins</th><th>Win rate</th><th>Avg bid price</th></tr>
+            </thead>
+            <tbody>
+                @for (bucket of data.by_device; track bucket.key) {
+                    <tr>
+                        <td>{{ bucket.key }}</td>
+                        <td>{{ bucket.bids | number }}</td>
+                        <td>{{ bucket.wins | number }}</td>
+                        <td>{{ bucket.win_rate | percent:'1.1-2' }}</td>
+                        <td>{{ bucket.avg_bid_price | number:'1.2-4' }}</td>
+                    </tr>
+                } @empty {
+                    <tr><td colspan="5" class="sess-table__empty">No data yet.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
+
+    <section class="sess-targeting__section">
+        <h2>By segment</h2>
+        <table class="sess-table">
+            <thead>
+                <tr><th>Segment</th><th>Bids</th><th>Wins</th><th>Win rate</th><th>Avg bid price</th></tr>
+            </thead>
+            <tbody>
+                @for (bucket of data.by_segment; track bucket.key) {
+                    <tr>
+                        <td>{{ bucket.key }}</td>
+                        <td>{{ bucket.bids | number }}</td>
+                        <td>{{ bucket.wins | number }}</td>
+                        <td>{{ bucket.win_rate | percent:'1.1-2' }}</td>
+                        <td>{{ bucket.avg_bid_price | number:'1.2-4' }}</td>
+                    </tr>
+                } @empty {
+                    <tr><td colspan="5" class="sess-table__empty">No data yet.</td></tr>
+                }
+            </tbody>
+        </table>
+    </section>
+} @else {
+    <p class="sess-loading">Loading…</p>
+}

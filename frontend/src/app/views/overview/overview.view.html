@@ -1,0 +1,93 @@
+@if (stats.value(); as s) {
+    <div class="sess-overview__header">
+        <h1>Overview</h1>
+        <span class="sess-overview__meta">
+            Bidder <strong>{{ s.bidder_id }}</strong> · updated {{ s.generated_at }}
+        </span>
+    </div>
+
+    <div class="sess-overview__cards">
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Auctions</span>
+            <span class="sess-overview__value">{{ s.total_auctions | number }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Bids</span>
+            <span class="sess-overview__value">{{ s.bids | number }}</span>
+            <span class="sess-overview__sub">{{ s.no_bids | number }} no-bids</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Bid rate</span>
+            <span class="sess-overview__value">{{ s.bid_rate | percent:'1.1-2' }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Wins</span>
+            <span class="sess-overview__value">{{ s.wins | number }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Win rate</span>
+            <span class="sess-overview__value">{{ s.win_rate | percent:'1.1-2' }}</span>
+            <span class="sess-overview__sub">{{ s.win_rate_per_auction | percent:'1.1-2' }} per auction</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Avg bid price</span>
+            <span class="sess-overview__value">{{ s.avg_bid_price | number:'1.2-4' }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Avg win price</span>
+            <span class="sess-overview__value">{{ s.avg_win_price | number:'1.2-4' }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Total spend</span>
+            <span class="sess-overview__value">{{ s.total_spend | number:'1.2-2' }}</span>
+        </div>
+        <div class="sess-overview__card">
+            <span class="sess-overview__label">Budget</span>
+            <span class="sess-overview__value">{{ s.remaining_budget | number:'1.2-2' }}</span>
+            <span class="sess-overview__sub">of {{ s.budget | number:'1.2-2' }} left</span>
+        </div>
+    </div>
+
+    <div class="sess-overview__panels">
+        <section class="sess-overview__panel">
+            <h2>Latency (ms)</h2>
+            <table class="sess-table">
+                <tbody>
+                    <tr><th>Average</th><td>{{ s.latency_ms.avg | number:'1.0-2' }}</td></tr>
+                    <tr><th>p50</th><td>{{ s.latency_ms.p50 }}</td></tr>
+                    <tr><th>p95</th><td>{{ s.latency_ms.p95 }}</td></tr>
+                    <tr><th>Max</th><td>{{ s.latency_ms.max }}</td></tr>
+                    <tr><th>Samples</th><td>{{ s.latency_ms.count | number }}</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="sess-overview__panel">
+            <h2>No-bid reasons</h2>
+            <table class="sess-table">
+                <tbody>
+                    <tr><th>Budget exhausted</th><td>{{ s.no_bid_reasons.budget_exhausted | number }}</td></tr>
+                    <tr><th>No eligible creative</th><td>{{ s.no_bid_reasons.no_eligible_creative | number }}</td></tr>
+                    <tr><th>Targeting miss</th><td>{{ s.no_bid_reasons.targeting_miss | number }}</td></tr>
+                </tbody>
+            </table>
+        </section>
+
+        <section class="sess-overview__panel">
+            <h2>Pacing</h2>
+            <table class="sess-table">
+                <tbody>
+                    <tr><th>Spend / minute</th><td>{{ s.pacing.spend_per_minute | number:'1.2-2' }}</td></tr>
+                    <tr><th>Elapsed minutes</th><td>{{ s.pacing.elapsed_minutes | number:'1.0-1' }}</td></tr>
+                    <tr>
+                        <th>Minutes to exhaustion</th>
+                        <td>{{ s.pacing.projected_minutes_to_exhaustion === null ? '—' : (s.pacing.projected_minutes_to_exhaustion | number:'1.0-1') }}</td>
+                    </tr>
+                    <tr><th>Budget used</th><td>{{ s.pacing.budget_utilization | percent:'1.1-2' }}</td></tr>
+                </tbody>
+            </table>
+        </section>
+    </div>
+} @else {
+    <p class="sess-loading">Loading…</p>
+}

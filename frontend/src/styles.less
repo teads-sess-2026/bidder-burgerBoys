@@ -1,0 +1,60 @@
+html {
+    --color-background: #FAFAFC;
+    --color-hover: #EEEEEE;
+    --color-border: #DDDDDD;
+    --color-border-active: #999999;
+    --color-text-lighter: #AAAAAA;
+    --color-text-light: #666666;
+    --font-size-icon: 24px;
+    --spacing-small: 8px;
+    --spacing-huge: 24px;
+    --border-radius: 4px;
+}
+
+body {
+    margin: 0;
+    font-family: Roboto, sans-serif;
+}
+
+a {
+    color: inherit;
+    text-decoration: none;
+}
+
+input[type=text],
+textarea {
+    border: 1px solid var(--color-border);
+    padding: var(--spacing-small);
+    border-radius: var(--border-radius);
+    outline: none;
+
+    &:focus-visible {
+        outline: 1px solid var(--color-border-active);
+    }
+}
+
+.sess-table {
+    border-collapse: collapse;
+    width: 100%;
+
+    th,
+    td {
+        border: 1px solid var(--color-border);
+        padding: var(--spacing-small);
+        text-align: left;
+    }
+
+    thead th {
+        background-color: var(--color-hover);
+    }
+
+    .sess-table__empty {
+        text-align: center;
+        color: var(--color-text-light);
+    }
+}
+
+.sess-loading {
+    color: var(--color-text-light);
+    padding: var(--spacing-huge);
+}

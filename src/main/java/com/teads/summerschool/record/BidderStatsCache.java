@@ -311,6 +311,15 @@ public class BidderStatsCache {
         return Mono.just(result);
     }
 
+    /** Synchronous O(1) read of a single creative's remaining budget. */
+    public double getCachedRemainingBudget(String creativeId) {
+        double[] holder = budgets.computeIfAbsent(creativeId,
+                k -> new double[]{properties.getCreativeBudget()});
+        synchronized (holder) {
+            return holder[0];
+        }
+    }
+
     /** Total remaining budget across all creatives. Fully in-memory, no I/O. */
     public double getTotalRemainingBudget() {
         double total = 0.0;
