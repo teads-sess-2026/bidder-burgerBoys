@@ -1,0 +1,40 @@
+<h1>Trends</h1>
+
+@if (timeseries.value(); as data) {
+    <p class="sess-trends__meta">
+        Last {{ data.window_minutes }} minutes, {{ data.bucket_seconds }}s buckets
+        ({{ data.points.length }} points).
+    </p>
+    <table class="sess-table">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Auctions</th>
+                <th>Bids</th>
+                <th>Wins</th>
+                <th>Bid rate</th>
+                <th>Win rate</th>
+                <th>Avg bid price</th>
+                <th>Spend</th>
+            </tr>
+        </thead>
+        <tbody>
+            @for (point of data.points; track point.time) {
+                <tr>
+                    <td>{{ point.time }}</td>
+                    <td>{{ point.auctions | number }}</td>
+                    <td>{{ point.bids | number }}</td>
+                    <td>{{ point.wins | number }}</td>
+                    <td>{{ point.bid_rate | percent:'1.1-2' }}</td>
+                    <td>{{ point.win_rate | percent:'1.1-2' }}</td>
+                    <td>{{ point.avg_bid_price | number:'1.2-4' }}</td>
+                    <td>{{ point.spend | number:'1.2-2' }}</td>
+                </tr>
+            } @empty {
+                <tr><td colspan="8" class="sess-table__empty">No data yet.</td></tr>
+            }
+        </tbody>
+    </table>
+} @else {
+    <p class="sess-loading">Loading…</p>
+}

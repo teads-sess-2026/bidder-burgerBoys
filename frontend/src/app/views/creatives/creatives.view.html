@@ -1,0 +1,56 @@
+<h1>Creatives</h1>
+
+<div class="sess-creatives__controls">
+    <label>
+        Sort by
+        <select [(ngModel)]="sort">
+            <option value="spend">Spend</option>
+            <option value="wins">Wins</option>
+            <option value="bids">Bids</option>
+            <option value="bid_rate">Bid rate</option>
+            <option value="win_rate">Win rate</option>
+        </select>
+    </label>
+    <label>
+        Order
+        <select [(ngModel)]="order">
+            <option value="desc">Descending</option>
+            <option value="asc">Ascending</option>
+        </select>
+    </label>
+</div>
+
+@if (creatives.value(); as data) {
+    <table class="sess-table">
+        <thead>
+            <tr>
+                <th>Creative</th>
+                <th>Bids</th>
+                <th>Wins</th>
+                <th>Win rate</th>
+                <th>Avg bid price</th>
+                <th>Avg win price</th>
+                <th>Spend</th>
+            </tr>
+        </thead>
+        <tbody>
+            @for (creative of data.creatives; track creative.creative_id) {
+                <tr>
+                    <td>{{ creative.creative_name ?? '(unknown)' }}</td>
+                    <td>{{ creative.bids | number }}</td>
+                    <td>{{ creative.wins | number }}</td>
+                    <td>{{ creative.win_rate | percent:'1.1-2' }}</td>
+                    <td>{{ creative.avg_bid_price | number:'1.2-4' }}</td>
+                    <td>{{ creative.avg_win_price | number:'1.2-4' }}</td>
+                    <td>{{ creative.spend | number:'1.2-2' }}</td>
+                </tr>
+            } @empty {
+                <tr>
+                    <td colspan="7" class="sess-table__empty">No creatives with activity yet.</td>
+                </tr>
+            }
+        </tbody>
+    </table>
+} @else {
+    <p class="sess-loading">Loading…</p>
+}
