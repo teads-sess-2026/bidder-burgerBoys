@@ -32,7 +32,7 @@ jobs:
 
       - name: Deploy to S3
         run: |
-          TEAM=${GITHUB_REPOSITORY##*/bidder-}
+          TEAM=$(echo "${GITHUB_REPOSITORY##*/bidder-}" | tr '[:upper:]' '[:lower:]')
           aws s3 sync dist/frontend/browser/ s3://${{ secrets.FE_S3_BUCKET }}/$TEAM/ --delete \
             --exclude "index.html" --cache-control "public,max-age=31536000,immutable"
           aws s3 cp dist/frontend/browser/index.html s3://${{ secrets.FE_S3_BUCKET }}/$TEAM/index.html \
