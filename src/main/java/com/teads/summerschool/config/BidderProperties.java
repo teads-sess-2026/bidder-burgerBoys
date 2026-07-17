@@ -39,6 +39,7 @@ public class BidderProperties {
         private double pacingBoost = 1.10;
         private double pacingCut = 0.85;
         private double maxBudgetFraction = 0.05;
+        private double maxBidPriceFraction = 0.10;
 
         public int getMinSamples() { return minSamples; }
         public void setMinSamples(int minSamples) { this.minSamples = minSamples; }
@@ -63,6 +64,9 @@ public class BidderProperties {
 
         public double getMaxBudgetFraction() { return maxBudgetFraction; }
         public void setMaxBudgetFraction(double maxBudgetFraction) { this.maxBudgetFraction = maxBudgetFraction; }
+
+        public double getMaxBidPriceFraction() { return maxBidPriceFraction; }
+        public void setMaxBidPriceFraction(double maxBidPriceFraction) { this.maxBidPriceFraction = maxBidPriceFraction; }
     }
 
     public static class Competition {

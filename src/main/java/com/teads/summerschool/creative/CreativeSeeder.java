@@ -28,8 +28,6 @@ public class CreativeSeeder implements ApplicationRunner {
 
     private static final int    CREATIVE_COUNT    = 200;
     private static final long   SEED              = 42;
-    private static final double MAX_BID_PRICE_MIN = 0.05;
-    private static final double MAX_BID_PRICE_MAX = 0.30;
 
     private final CreativeRepository repository;
     private final BidderProperties   properties;
@@ -49,11 +47,12 @@ public class CreativeSeeder implements ApplicationRunner {
         String id = properties.getId();
         Random rnd = new Random(SEED);
         List<Creative> creatives = new ArrayList<>(CREATIVE_COUNT);
+        double maxBidPrice = properties.getCreativeBudget() * properties.getStrategy().getMaxBidPriceFraction();
         for (int i = 1; i <= CREATIVE_COUNT; i++) {
             Creative c = creative(id + "-creative-" + i, "Creative " + i,
                     "Auto-generated creative #" + i,
                     pickSubset(GEOS, rnd), pickSubset(DEVICES, rnd), pickSubset(SEGMENTS, rnd));
-            c.setMaxBidPrice(MAX_BID_PRICE_MIN + rnd.nextDouble() * (MAX_BID_PRICE_MAX - MAX_BID_PRICE_MIN));
+            c.setMaxBidPrice(maxBidPrice);
             creatives.add(c);
         }
 

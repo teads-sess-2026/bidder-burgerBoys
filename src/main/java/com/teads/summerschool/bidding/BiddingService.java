@@ -135,19 +135,10 @@ public class BiddingService {
                             return finishNoBid(record, "budget_exhausted", startTime);
                         }
 
-                        // LAYER 4: Value-based skip — don't blow too much budget on one auction
-                        double maxAffordable = layer3.stream()
-                            .mapToDouble(c -> budgetMap.getOrDefault(c.getId(), 0.0))
-                            .max().orElse(0.0)
-                            * properties.getStrategy().getMaxBudgetFraction();
-                        if (request.floorPrice() > maxAffordable) {
-                            return finishNoBid(record, "too_expensive", startTime);
-                        }
-
-                        // LAYER 5: Rank creatives by specificity + budget health
+                        // LAYER 4: Rank creatives by specificity + budget health
                         List<Creative> ranked = rankCreatives(layer3);
 
-                        // LAYER 6+7: Try each creative in ranked order, computing bid price per candidate
+                        // LAYER 5: Try each creative in ranked order, computing bid price per candidate
                         return tryReserveInOrder(ranked, request, record, startTime);
                     });
             });
